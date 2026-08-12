@@ -93,8 +93,8 @@ The agent receives the merged fix payload for that round: the selected agent fin
 That history includes which finding IDs were selected for a prior fix attempt, which findings were left unselected by the user, and any one-line summaries from earlier fix commits.
 On follow-up review passes, that history tells the agent not to re-report user-ignored findings unless the code now presents a materially different issue.
 
-After a user-triggered fix, the step re-runs to verify the result. A clean result completes the step and continues the pipeline; if findings still require approval, the step pauses again in `fix_review` status. Review remains subject to its separate three-review cap: a routine round-2 finding cannot open round 3, and a terminal round-3 fix has no confirmation pass. At a resulting fix-review gate, you can approve, fix where the cap permits, skip, or abort.
-Yolo and AXI `--yes` approve a resulting fix-review gate automatically after their one fix round, so a finding that remains after the fix does not trigger an unbounded fix loop.
+After a user-triggered fix, the step normally re-runs and pauses again to show you the results (`fix_review` status). Review remains subject to its separate three-review cap: a routine round-2 finding cannot open round 3, and a terminal round-3 fix has no confirmation pass. You can then approve, fix where the cap permits, skip, or abort.
+Yolo and AXI `--yes` approve that fix review automatically after their one fix round, so a finding that remains after the fix does not trigger an unbounded fix loop.
 
 ## Fix commits
 
