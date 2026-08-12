@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,8 +27,8 @@ func TestNewPipelineAgentsUsesDistinctRoleSelections(t *testing.T) {
 		Agent:  types.AgentClaude,
 		Agents: []types.AgentName{types.AgentClaude},
 		AgentRoles: config.AgentRoles{
-			Reviewer:    config.AgentSelection{types.AgentCodex},
-			Implementer: config.AgentSelection{types.AgentClaude},
+			Reviewer:    config.RoleSelection{{Harness: types.AgentCodex}},
+			Implementer: config.RoleSelection{{Harness: types.AgentClaude}},
 		},
 	}
 	set, err := newPipelineAgents(context.Background(), cfg, func(bin string) (string, error) {
@@ -43,6 +44,87 @@ func TestNewPipelineAgentsUsesDistinctRoleSelections(t *testing.T) {
 	if got := set.Roles.Implementer.Name(); got != string(types.AgentClaude) {
 		t.Fatalf("implementer = %q, want claude", got)
 	}
+}
+
+func TestNewPipelineAgentsRunsSameHarnessCandidatesInDeclaredOrder(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "attempts.log")
+	first := config.AgentCandidate{
+		Harness:  types.AgentPi,
+		Provider: "openai",
+		Model:    "gpt-5.4",
+		Args:     []string{"-test.run=^TestStructuredRoleCandidateHelperProcess$", "--", "first"},
+	}
+	second := config.AgentCandidate{
+		Harness:  types.AgentPi,
+		Provider: "openai",
+		Model:    "gpt-5.3",
+		Args:     []string{"-test.run=^TestStructuredRoleCandidateHelperProcess$", "--", "second"},
+	}
+	cfg := &config.Config{
+		Agent:             types.AgentPi,
+		Agents:            []types.AgentName{types.AgentPi},
+		AgentPathOverride: map[string]string{"pi": os.Args[0]},
+		AgentRoles: config.AgentRoles{
+			Reviewer:    config.RoleSelection{first, second},
+			Implementer: config.RoleSelection{{Harness: types.AgentPi}},
+		},
+	}
+	set, err := newPipelineAgents(context.Background(), cfg, func(bin string) (string, error) { return bin, nil })
+	if err != nil {
+		t.Fatalf("newPipelineAgents: %v", err)
+	}
+	defer set.Close()
+
+	var attempts []agent.Attempt
+	result, err := set.Roles.Reviewer.Run(context.Background(), agent.RunOpts{
+		Prompt: "review",
+		CWD:    t.TempDir(),
+		Env: []string{
+			"NM_TEST_ROLE_CANDIDATE_HELPER=1",
+			"NM_TEST_ROLE_CANDIDATE_LOG=" + logPath,
+		},
+		OnAttempt: func(attempt agent.Attempt) { attempts = append(attempts, attempt) },
+	})
+	if err != nil {
+		t.Fatalf("reviewer Run: %v", err)
+	}
+	if len(attempts) != 2 || attempts[0].Agent != first.Label() || attempts[1].Agent != second.Label() {
+		t.Fatalf("attempts = %+v", attempts)
+	}
+	if result.Provider != second.Label() || result.Model != second.Model || result.ModelProvider != second.Provider {
+		t.Fatalf("result identity = %+v", result)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read helper log: %v", err)
+	}
+	if got := strings.Fields(string(data)); len(got) != 2 || got[0] != "first" || got[1] != "second" {
+		t.Fatalf("launch order = %q, want first then second", data)
+	}
+}
+
+func TestStructuredRoleCandidateHelperProcess(t *testing.T) {
+	if os.Getenv("NM_TEST_ROLE_CANDIDATE_HELPER") != "1" {
+		return
+	}
+	seat := ""
+	for i, arg := range os.Args {
+		if arg == "--" && i+1 < len(os.Args) {
+			seat = os.Args[i+1]
+			break
+		}
+	}
+	f, err := os.OpenFile(os.Getenv("NM_TEST_ROLE_CANDIDATE_LOG"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		os.Exit(2)
+	}
+	_, _ = fmt.Fprintln(f, seat)
+	_ = f.Close()
+	if seat == "first" {
+		os.Exit(1)
+	}
+	fmt.Println(`{"type":"agent_end","messages":[{"role":"assistant","content":"ok"}]}`)
+	os.Exit(0)
 }
 
 func TestValidateRecoveredSessionProviders_RejectsUnavailableFixerProvider(t *testing.T) {

@@ -196,8 +196,8 @@ func TestResolveAgent_ResolvesRoleSelectionsIndependently(t *testing.T) {
 		Agent:  types.AgentClaude,
 		Agents: []types.AgentName{types.AgentClaude},
 		AgentRoles: AgentRoles{
-			Reviewer:    AgentSelection{types.AgentCodex, types.AgentPi},
-			Implementer: AgentSelection{types.AgentClaude, types.AgentCodex},
+			Reviewer:    roleCandidates(types.AgentCodex, types.AgentPi),
+			Implementer: roleCandidates(types.AgentClaude, types.AgentCodex),
 		},
 	}
 

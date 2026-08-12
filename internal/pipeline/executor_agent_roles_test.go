@@ -75,6 +75,38 @@ func (a *runOverrideAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.
 	return a.run(ctx, opts)
 }
 
+func TestRoleSelectionLogsDistinctSameHarnessCandidatesWithoutArguments(t *testing.T) {
+	first := agent.WithIdentity(
+		&runOverrideAgent{Agent: &roleRecordingAgent{name: "pi"}, run: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			return nil, errors.New("pi start: executable unavailable")
+		}},
+		agent.Identity{Name: "pi[openai/gpt-5.4]@a1b2c3d4", ModelProvider: "openai", Model: "gpt-5.4"},
+	)
+	second := agent.WithIdentity(
+		&roleRecordingAgent{name: "pi"},
+		agent.Identity{Name: "pi[openai/gpt-5.3]@d4c3b2a1", ModelProvider: "openai", Model: "gpt-5.3"},
+	)
+	var logs []string
+	observable := &observableRoleAgent{
+		inner:      agent.NewFallback([]agent.Agent{first, second}),
+		role:       "reviewer",
+		candidates: []string{first.Name(), second.Name()},
+		log:        func(line string) { logs = append(logs, line) },
+	}
+	if _, err := observable.Run(context.Background(), agent.RunOpts{}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	joined := strings.Join(logs, "\n")
+	for _, want := range []string{first.Name(), second.Name()} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("logs do not identify candidate %q: %s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "--model") || strings.Contains(joined, "api-key") {
+		t.Fatalf("logs expose candidate arguments: %s", joined)
+	}
+}
+
 func TestExecutorRoutesReviewerAndImplementerRoles(t *testing.T) {
 	database, p, run, repo := setupTest(t)
 	implementer := &roleRecordingAgent{name: "implementer-agent"}
