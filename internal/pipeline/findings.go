@@ -238,6 +238,35 @@ func autoFixableFindingsJSON(raw string) string {
 	return fixableRaw
 }
 
+func round3EligibleFindingsJSON(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	findings, err := types.ParseFindingsJSON(raw)
+	if err != nil {
+		return ""
+	}
+	filtered := findings
+	filtered.Items = nil
+	for _, item := range findings.Items {
+		// Round 3 is reserved for merge-blocking severe correctness or
+		// security defects. The reviewer must both opt in explicitly and use
+		// error severity (the schema's "should absolutely not get merged"
+		// bucket); warning/info can never open the exceptional round.
+		if item.Round3Eligible && item.Severity == "error" {
+			filtered.Items = append(filtered.Items, item)
+		}
+	}
+	if len(filtered.Items) == 0 {
+		return ""
+	}
+	encoded, err := types.MarshalFindingsJSON(filtered)
+	if err != nil {
+		return ""
+	}
+	return encoded
+}
+
 func hasAskUserFindingsJSON(raw string) bool {
 	if raw == "" {
 		return false

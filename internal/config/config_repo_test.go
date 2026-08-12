@@ -76,6 +76,23 @@ ignore_patterns:
 	}
 }
 
+func TestLoadRepo_AgentRolesAcceptOrderedSelections(t *testing.T) {
+	dir := t.TempDir()
+	data := `agent_roles:
+  reviewer: [codex, claude]
+  implementer: pi
+`
+	if err := os.WriteFile(filepath.Join(dir, ".no-mistakes.yaml"), []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadRepo(dir)
+	if err != nil {
+		t.Fatalf("LoadRepo: %v", err)
+	}
+	assertAgentSelection(t, cfg.AgentRoles.Reviewer, types.AgentCodex, types.AgentClaude)
+	assertAgentSelection(t, cfg.AgentRoles.Implementer, types.AgentPi)
+}
+
 func TestLoadRepo_AgentAcceptsList(t *testing.T) {
 	dir := t.TempDir()
 	data := `agent: [codex, claude]

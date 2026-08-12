@@ -26,17 +26,29 @@ func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 		ignorePatterns = strings.Join(sctx.Config.IgnorePatterns, ", ")
 	}
 
-	reviewScope := fmt.Sprintf("branch changes between %s and %s", baseSHA, sctx.Run.HeadSHA)
-	if sctx.Fixing {
-		startingHeadSHA := sctx.ReviewStartingHeadSHA
-		if startingHeadSHA == "" {
-			startingHeadSHA = sctx.Run.HeadSHA
+	reviewRound := sctx.ReviewRound
+	if reviewRound <= 0 {
+		if sctx.Fixing {
+			reviewRound = 2
+		} else {
+			reviewRound = 1
 		}
-		reviewScope = fmt.Sprintf("current worktree and HEAD changes relative to base commit %s (starting head %s)", baseSHA, startingHeadSHA)
+	}
+	startingHeadSHA := sctx.ReviewStartingHeadSHA
+	if startingHeadSHA == "" {
+		// Direct Step tests and embeddings may not have an executor to stamp the
+		// anchor. Capture it before the implementer can advance Run.HeadSHA.
+		startingHeadSHA = sctx.Run.HeadSHA
+	}
+	reviewScope := fmt.Sprintf("branch changes between %s and %s", baseSHA, sctx.Run.HeadSHA)
+	if reviewRound > 1 {
+		reviewScope = fmt.Sprintf("only implementer changes after %s through current HEAD/worktree %s", startingHeadSHA, sctx.Run.HeadSHA)
 	}
 
 	// Bounded workload size (changed files + net lines) for local telemetry, so
 	// review/fix efficiency can be normalized without external git archaeology.
+	// The implementer starts with the prior review's branch context; after it
+	// commits, narrowed reviewer rounds replace this with their fix-only diff.
 	// Best-effort: a diff-stat failure leaves the workload unknown.
 	workload := reviewWorkload(ctx, sctx.WorkDir, baseSHA, sctx.Run.HeadSHA)
 
@@ -75,7 +87,8 @@ Context:
 - ignore patterns: %s
 
 Rules:
-- Always start with double checking whether the findings are legitimate.
+- Evaluate each finding independently from the code and evidence. Applying a change and declining a finding are equally acceptable outcomes.
+- Change code only for findings you conclude are legitimate; leave declined findings untouched.
 - Before changing code, identify whether each finding is a local defect or a symptom of a deeper design, abstraction, validation, ownership, or test-coverage flaw. Prefer the smallest correct root-cause fix within the changed area over patching only the reported line.
 - If a narrow fix would leave the same class of bug likely elsewhere, fix the deepest practical cause instead.
 - Avoid resolving a finding by removing or reverting the author's intentional code in their original 1st commit. If the original change introduced something on purpose, fix it forward (e.g. add validation, handle edge cases, tighten logic) rather than deleting it. Similarly, if the original change intentionally deleted or simplified code, do not restore or re-add the removed code unless the finding is a legitimate correctness, reliability, or security issue and the smallest reasonable fix happens to reintroduce a small amount of previously deleted logic. When in doubt about whether code is intentional, leave it and report the finding as unresolved.
@@ -114,6 +127,13 @@ Previous review findings to address:
 		}
 		fixSummary = summary
 	}
+	if sctx.TerminalReviewFixOnly {
+		return &pipeline.StepOutcome{FixSummary: fixSummary}, nil
+	}
+	if reviewRound > 1 {
+		reviewScope = fmt.Sprintf("only implementer changes after %s through current HEAD/worktree %s", startingHeadSHA, sctx.Run.HeadSHA)
+		workload = reviewWorkload(ctx, sctx.WorkDir, startingHeadSHA, sctx.Run.HeadSHA)
+	}
 	reviewTargetSHA := sctx.Run.HeadSHA
 
 	// The changed-file set is read once and viewed two ways on purpose: the
@@ -121,8 +141,8 @@ Previous review findings to address:
 	// trusted path instructions are selected against the complete set (see
 	// matchPathInstructions).
 	var args []string
-	if sctx.Fixing {
-		args = []string{"diff", "--name-only", "-z", "--no-renames", baseSHA}
+	if reviewRound > 1 {
+		args = []string{"diff", "--name-only", "-z", "--no-renames", startingHeadSHA}
 	} else {
 		args = []string{"diff", "--name-only", "-z", "--no-renames", baseSHA + ".." + sctx.Run.HeadSHA}
 	}
@@ -179,19 +199,8 @@ Previous review findings to address:
 	logPathInstructions(sctx.Log, pathInstructionMatches)
 	pathInstructions := reviewPathInstructionsSection(pathInstructionMatches)
 
-	prompt := fmt.Sprintf(
-		`Review the code changes and return structured findings with a risk assessment.
-
-Context:
-- branch: %s
-- base commit: %s
-- target commit: %s
-- review scope: %s
-- default branch: %s
-- ignore patterns: %s
-
-Task:
-- Read the relevant history and diff yourself.
+	reviewRequest := "Review the code changes and return structured findings with a risk assessment."
+	taskInstructions := `- Read the relevant history and diff yourself.
 - Focus findings on risks introduced by changed code, but inspect surrounding code, call sites, shared helpers, tests, and invariants when needed to understand root cause.
 - Determine from the stated intent and relevant evidence whether a bug-fix change claims a durable fix or explicitly authorized short-term containment.
 - For a claimed durable fix, reconstruct the concrete failing sequence and required invariant, inspect relevant sibling paths and shared state transitions, and ask whether the same authorized failure remains reachable.
@@ -202,9 +211,39 @@ Task:
 - Analyze for bugs, risks, and code simplification opportunities.
 - "Simplification" means reducing code complexity through non-functional refactoring (e.g. deduplication, clearer control flow). It does NOT mean removing features, changing product behavior, or stripping intentional user-facing output.
 - Treat security issues, performance regressions, breaking changes, and insufficient error handling as risks.
-- Do a full review pass before returning. Do not stop after the first valid finding. Continue inspecting the rest of the changed code until you have enumerated all material issues you can substantiate.
+- Do a full review pass before returning. Do not stop after the first valid finding. Continue inspecting the rest of the changed code until you have enumerated all material issues you can substantiate.`
+	roundEligibilityRules := "- Set round3_eligible to false for every finding."
+	if reviewRound > 1 {
+		reviewRequest = fmt.Sprintf("Verify agreed review fixes in reviewer round %d and return structured findings with a risk assessment.", reviewRound)
+		taskInstructions = `- Review only the fixes the implementer agreed with and applied after the previous reviewer round.
+- Inspect the fix-only diff named in review scope and enough surrounding code to determine whether each applied fix is correct.
+- Do not repeat the whole-slice review, revive a declined finding, or search unchanged parts of the original change for additional improvements.
+- Treat the implementer's summary and prior findings as claims, not evidence; verify the actual applied code.
+- A same-fix test is part of the implementation claim, not independent proof. Judge whether it asserts the correct behavior and could pass with the fix wrong.
+- Do NOT run tests during review. The pipeline has a dedicated test step after review.`
+		roundEligibilityRules = `- Set round3_eligible to true only in reviewer round 2, and only for a newly surfaced severe correctness or security defect introduced or exposed by an agreed fix that should not merge without another independent review. Set it false for every other finding.
+- A routine incomplete fix, disagreement with the prior finding, optional improvement, warning, or issue outside the agreed-fix diff is not round3_eligible.`
+		if reviewRound >= 3 {
+			roundEligibilityRules = `- This is the terminal reviewer round. Set round3_eligible to false for every finding. The implementer may apply returned fixes, but there will be no confirmation review and no reviewer round 4.`
+		}
+	}
+
+	prompt := fmt.Sprintf(
+		`%s
+
+Context:
+- branch: %s
+- base commit: %s
+- target commit: %s
+- review scope: %s
+- default branch: %s
+- ignore patterns: %s
+
+Task:
+%s
 
 Rules:
+%s
 - Anchor every finding to a specific file and one-indexed line number in the changed code when possible.
 - Use severity "error" for problems that should absolutely not get merged, "warning" for things that are worth addressing but can be done in a follow up, and "info" for things that are nice to have.
 - Be concise and actionable. No generic advice like "add more tests".
@@ -227,12 +266,15 @@ Risk assessment (after listing all findings):
 - Set risk_level to "high" if the change should not be merged without explicit human approval - it is fundamental, risky, ambiguous, or has strong negative signals.
 - Provide a one-sentence risk_rationale explaining why you chose that risk level.
 - Set risk_scope to "source-or-external" when the assessment reflects source risk or enforceable external state, and to "pipeline-owned-delivery" only when it is based solely on a deferred outcome this run owns.%s%s`,
+		reviewRequest,
 		branch,
 		baseSHA,
 		sctx.Run.HeadSHA,
 		reviewScope,
 		sctx.Repo.DefaultBranch,
 		ignorePatterns,
+		taskInstructions,
+		roundEligibilityRules,
 		historySection,
 		pathInstructions,
 	)
@@ -248,7 +290,11 @@ Risk assessment (after listing all findings):
 	// cross-round context a rereview legitimately needs travels in the
 	// explicit sanitized round-history section above; only the fixer keeps a
 	// durable session (executeFixMode), because it certifies nothing.
-	result, err := sctx.Agent.Run(ctx, agent.RunOpts{
+	reviewer := sctx.ReviewerAgent
+	if reviewer == nil {
+		reviewer = sctx.Agent
+	}
+	result, err := reviewer.Run(ctx, agent.RunOpts{
 		Prompt:     prompt,
 		CWD:        sctx.WorkDir,
 		Env:        sctx.Env,
@@ -279,6 +325,14 @@ Risk assessment (after listing all findings):
 		findings = stripped
 	}
 
+	// The round-3 gate is meaningful only on round 2. Clear model-supplied
+	// values everywhere else so malformed output cannot reset or evade the cap.
+	if reviewRound != 2 {
+		for i := range findings.Items {
+			findings.Items[i].Round3Eligible = false
+		}
+	}
+
 	needsApproval := hasBlockingFindings(findings.Items)
 	findingsJSON, _ := json.Marshal(findings)
 
@@ -288,6 +342,15 @@ Risk assessment (after listing all findings):
 		Findings:      string(findingsJSON),
 		FixSummary:    fixSummary,
 	})
+}
+
+// ExecuteTerminalReviewFix applies terminal round-3 findings with the
+// implementer seat and deliberately performs no confirmation review.
+func (s *ReviewStep) ExecuteTerminalReviewFix(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	previous := sctx.TerminalReviewFixOnly
+	sctx.TerminalReviewFixOnly = true
+	defer func() { sctx.TerminalReviewFixOnly = previous }()
+	return s.Execute(sctx)
 }
 
 // fixRoundProvenanceClause reframes a rereview's fix-round changes as
@@ -311,8 +374,8 @@ Fix-round provenance:
 `
 }
 
-// approvedReviewOutcome captures the immutable commit examined by this full
-// review round. The executor persists it only if this outcome ultimately
+// approvedReviewOutcome captures the immutable commit examined by this
+// reviewer pass. The executor persists it only if this outcome ultimately
 // completes the review step, so parked, failed, skipped, and superseded rounds
 // cannot gain or advance approval authority.
 func approvedReviewOutcome(reviewTargetSHA string, outcome *pipeline.StepOutcome) (*pipeline.StepOutcome, error) {

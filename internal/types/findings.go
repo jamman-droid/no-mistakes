@@ -49,6 +49,11 @@ type Finding struct {
 	Source           string `json:"source,omitempty"`
 	UserInstructions string `json:"user_instructions,omitempty"`
 	ReviewScope      string `json:"review_scope,omitempty"`
+	// Round3Eligible is review-loop control evidence. It may be true only on
+	// round 2 for a severe correctness or security defect introduced or exposed
+	// by an agreed fix. The executor fails safe and ignores it in every other
+	// round.
+	Round3Eligible bool `json:"round3_eligible,omitempty"`
 	// Category separates the combined document+lint housekeeping pass's
 	// findings into their owning gates. Empty everywhere else.
 	Category string `json:"category,omitempty"`
@@ -73,6 +78,7 @@ type findingWire struct {
 	Source              string `json:"source,omitempty"`
 	UserInstructions    string `json:"user_instructions,omitempty"`
 	ReviewScope         string `json:"review_scope,omitempty"`
+	Round3Eligible      bool   `json:"round3_eligible,omitempty"`
 	Category            string `json:"category,omitempty"`
 	RequiresHumanReview *bool  `json:"requires_human_review,omitempty"`
 }
@@ -336,6 +342,7 @@ func (f *Finding) UnmarshalJSON(data []byte) error {
 	f.Source = wire.Source
 	f.UserInstructions = wire.UserInstructions
 	f.ReviewScope = wire.ReviewScope
+	f.Round3Eligible = wire.Round3Eligible
 	f.Category = wire.Category
 	if f.Action == "" && wire.RequiresHumanReview != nil {
 		if *wire.RequiresHumanReview {

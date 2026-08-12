@@ -14,11 +14,16 @@ var ErrFatalGateReconciliation = errors.New("fatal gate reconciliation")
 
 // StepContext provides shared resources to pipeline steps during execution.
 type StepContext struct {
-	Ctx                   context.Context
-	Run                   *db.Run
-	Repo                  *db.Repo
-	WorkDir               string
-	Agent                 agent.Agent
+	Ctx     context.Context
+	Run     *db.Run
+	Repo    *db.Repo
+	WorkDir string
+	// Agent is the implementer seat used by every non-review invocation and
+	// by review-fix turns.
+	Agent agent.Agent
+	// ReviewerAgent is the independent reviewer seat. It may equal Agent when
+	// no reviewer-specific selection is configured.
+	ReviewerAgent         agent.Agent
 	Config                *config.Config
 	DB                    *db.DB
 	Log                   func(string) // discrete log line (newline-terminated, user-visible + file)
@@ -27,6 +32,12 @@ type StepContext struct {
 	Fixing                bool         // true when re-executing after a "fix" action
 	SkipFixExecution      bool         // replay an already-completed fix round's review turn only
 	ReviewStartingHeadSHA string
+	// ReviewRound is the 1-based reviewer pass. It stays capped at three;
+	// terminal fix application after round 3 is not another review round.
+	ReviewRound int
+	// TerminalReviewFixOnly asks ReviewStep to apply findings after terminal
+	// reviewer round 3 without launching a confirmation reviewer round.
+	TerminalReviewFixOnly bool
 	PreviousFindings      string // JSON findings from the previous execution (set during fix loop)
 	// StepResultID is the DB row ID of the current step's step_results record.
 	// Steps use it to query their own round history for multi-round prompts.
@@ -67,6 +78,15 @@ func (sctx *StepContext) RunAgentSession(role SessionRole, opts agent.RunOpts) (
 	return sctx.Sessions.Run(sctx.Ctx, sctx.Agent, role, opts, sctx.Log)
 }
 
+// AgentRoles supplies independently supervised pipeline seats. Implementer is
+// used for ordinary work and fixes; Reviewer is used only for review turns.
+// Callers that do not need role routing can keep using NewExecutor, which seats
+// the same Agent in both roles.
+type AgentRoles struct {
+	Implementer agent.Agent
+	Reviewer    agent.Agent
+}
+
 // StepOutcome is the result of executing a pipeline step.
 type StepOutcome struct {
 	NeedsApproval bool // whether the step pauses for user action
@@ -81,8 +101,8 @@ type StepOutcome struct {
 	// mode so the executor can persist it on the round record and later
 	// rounds can reference what was previously attempted.
 	FixSummary string
-	// ReviewApprovedHeadSHA is set only by a successfully executed full review
-	// round. The executor durably records it only when the review step actually
+	// ReviewApprovedHeadSHA is set only by a successfully executed reviewer
+	// pass. The executor durably records it only when the review step actually
 	// completes, never while that outcome is parked or after a failed round.
 	ReviewApprovedHeadSHA string
 
@@ -108,6 +128,13 @@ type Step interface {
 // invokes it with a bounded context while also waiting for an approval. A true
 // result completes the step through the normal success path; false or an error
 // leaves the gate parked. Implementations must be read-only and fail closed.
+// TerminalReviewFixer applies findings returned by terminal reviewer round 3
+// without starting another reviewer pass. The implementation remains an
+// ordinary supervised step-agent invocation.
+type TerminalReviewFixer interface {
+	ExecuteTerminalReviewFix(*StepContext) (*StepOutcome, error)
+}
+
 type ApprovalGateReconciler interface {
 	ReconcileApprovalGate(sctx *StepContext) (resolved bool, err error)
 }

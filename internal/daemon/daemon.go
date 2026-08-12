@@ -400,7 +400,7 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager) {
 		slog.Error("failed to recover stale runs", "error", err)
 		logStartupPhase("stale_runs", staleStarted, "failed", true)
 		for _, plan := range plans {
-			_ = plan.agent.Close()
+			_ = plan.agents.Close()
 		}
 		return
 	}

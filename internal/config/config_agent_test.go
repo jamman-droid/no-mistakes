@@ -191,6 +191,31 @@ func TestResolveAgent_AutoPicksFirstAvailable(t *testing.T) {
 	}
 }
 
+func TestResolveAgent_ResolvesRoleSelectionsIndependently(t *testing.T) {
+	cfg := &Config{
+		Agent:  types.AgentClaude,
+		Agents: []types.AgentName{types.AgentClaude},
+		AgentRoles: AgentRoles{
+			Reviewer:    AgentSelection{types.AgentCodex, types.AgentPi},
+			Implementer: AgentSelection{types.AgentClaude, types.AgentCodex},
+		},
+	}
+
+	err := cfg.ResolveAgent(context.Background(), func(bin string) (string, error) {
+		switch bin {
+		case "claude", "codex":
+			return "/usr/bin/" + bin, nil
+		default:
+			return "", &exec.Error{Name: bin, Err: exec.ErrNotFound}
+		}
+	})
+	if err != nil {
+		t.Fatalf("ResolveAgent: %v", err)
+	}
+	assertAgentSelection(t, cfg.AgentRoles.Reviewer, types.AgentCodex)
+	assertAgentSelection(t, cfg.AgentRoles.Implementer, types.AgentClaude, types.AgentCodex)
+}
+
 func TestResolveAgent_ListPicksFirstAvailableAndKeepsFallbacks(t *testing.T) {
 	cfg := &Config{Agents: []types.AgentName{types.AgentClaude, types.AgentCodex, types.AgentPi}}
 

@@ -45,9 +45,11 @@ type Executor struct {
 	db     *db.DB
 	paths  *paths.Paths
 	config *config.Config
-	agent  agent.Agent
-	steps  []Step
-	skips  map[types.StepName]bool
+	agents AgentRoles
+	// agent remains the implementer alias for existing executor internals.
+	agent agent.Agent
+	steps []Step
+	skips map[types.StepName]bool
 
 	onEvent EventFunc
 
@@ -80,6 +82,19 @@ func (e *Executor) SetSkippedSteps(steps []types.StepName) {
 
 // NewExecutor creates a pipeline executor.
 func NewExecutor(database *db.DB, p *paths.Paths, cfg *config.Config, ag agent.Agent, steps []Step, onEvent EventFunc) *Executor {
+	return NewExecutorWithAgentRoles(database, p, cfg, AgentRoles{Implementer: ag, Reviewer: ag}, steps, onEvent)
+}
+
+// NewExecutorWithAgentRoles creates an executor with independent reviewer and
+// implementer seats. A missing seat inherits the other one, preserving the
+// single-agent behavior for partial integrations.
+func NewExecutorWithAgentRoles(database *db.DB, p *paths.Paths, cfg *config.Config, agents AgentRoles, steps []Step, onEvent EventFunc) *Executor {
+	if agents.Implementer == nil {
+		agents.Implementer = agents.Reviewer
+	}
+	if agents.Reviewer == nil {
+		agents.Reviewer = agents.Implementer
+	}
 	if onEvent == nil {
 		onEvent = func(ipc.Event) {}
 	}
@@ -87,7 +102,8 @@ func NewExecutor(database *db.DB, p *paths.Paths, cfg *config.Config, ag agent.A
 		db:                    database,
 		paths:                 p,
 		config:                cfg,
-		agent:                 ag,
+		agents:                agents,
+		agent:                 agents.Implementer,
 		steps:                 steps,
 		onEvent:               onEvent,
 		approvalCh:            make(chan approvalResponse, 1),
@@ -214,8 +230,8 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 }
 
 func (e *Executor) initializeRunScopes(runID string) {
-	sessionsEnabled := e.config != nil && e.config.SessionReuse && e.agent != nil
-	e.sessions = NewRunSessions(e.db, runID, e.agent, sessionsEnabled)
+	sessionsEnabled := e.config != nil && e.config.SessionReuse && e.agents.Implementer != nil
+	e.sessions = NewRunSessions(e.db, runID, e.agents.Implementer, sessionsEnabled)
 	e.shared = &RunShared{}
 }
 
@@ -391,6 +407,12 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		telemetry.Track("fix", e.fixTelemetryFields("user", gate.step.Name(), selectedFindingCount(gate.findings, response.findingIDs), 0))
 		selected := filterFindingsJSON(gate.findings, response.findingIDs)
 		merged := mergeUserOverridesJSON(selected, response.instructions, response.addedFindings)
+		if gate.step.Name() == types.StepReview && gate.round == 2 {
+			merged = round3EligibleFindingsJSON(merged)
+			if merged == "" {
+				return e.failRun(run, repo, fmt.Errorf("review round 3 refused: recovered round 2 did not surface a selected severe or security finding eligible for the exceptional terminal round"), ctx)
+			}
+		}
 		if gate.lastRoundID != "" {
 			allSelectedIDs := combineSelectedFindingIDs(response.findingIDs, merged)
 			if idsJSON := marshalFindingIDs(allSelectedIDs); idsJSON != "" {
@@ -664,19 +686,34 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	// invocation during execution of round N+1 sees roundNum still at N.
 	autoFixAttempts := state.autoFixAttempts
 	roundNum := state.roundNum
+	// invocationRound normally names the next reviewer round. Terminal fix
+	// application after round 3 reuses 3 because it is not reviewer round 4.
+	invocationRound := roundNum + 1
 
-	stepAgent := e.agent
-	if stepAgent != nil {
-		stepAgent = &gateStepBoundaryAgent{inner: stepAgent, phase: stepName}
-		stepAgent = &lifecycleAgent{inner: stepAgent, onLifecycle: onAgentLifecycle}
-		stepAgent = &perfRecordingAgent{
-			inner:    stepAgent,
+	decorateAgent := func(role string, selected agent.Agent) agent.Agent {
+		if selected == nil {
+			return nil
+		}
+		selected = &gateStepBoundaryAgent{inner: selected, phase: stepName}
+		selected = &lifecycleAgent{inner: selected, onLifecycle: onAgentLifecycle}
+		selected = &observableRoleAgent{
+			inner:      selected,
+			role:       role,
+			candidates: e.agentCandidates(role, selected.Name()),
+			log:        writeLog,
+			runID:      run.ID,
+			stepName:   stepName,
+		}
+		return &perfRecordingAgent{
+			inner:    selected,
 			db:       e.db,
 			runID:    run.ID,
 			stepName: stepName,
-			round:    func() int { return roundNum + 1 },
+			round:    func() int { return invocationRound },
 		}
 	}
+	stepAgent := decorateAgent("implementer", e.agents.Implementer)
+	reviewerAgent := decorateAgent("reviewer", e.agents.Reviewer)
 	ciReady := run.CIReadyAt != nil
 	ciReadyNoCI := run.CIReadyNoCI
 	ciReadinessChanged := func(ready, declaredNoCI bool) {
@@ -694,6 +731,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		Repo:             repo,
 		WorkDir:          workDir,
 		Agent:            stepAgent,
+		ReviewerAgent:    reviewerAgent,
 		Config:           e.config,
 		DB:               e.db,
 		StepResultID:     sr.ID,
@@ -723,8 +761,23 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 
 	// Execute with possible fix loop
 	for {
+		if stepName == types.StepReview && roundNum >= 3 {
+			if sctx.Fixing {
+				invocationRound = 3
+				if err := executeTerminalReviewFix(step, sctx); err != nil {
+					return false, err
+				}
+				writeLog("terminal review round 3 fix applied; no confirmation review will run")
+				goto done
+			}
+			return false, fmt.Errorf("review hard cap reached after terminal round 3; refusing reviewer round 4")
+		}
+		invocationRound = roundNum + 1
 		reviewStartingHeadSHA := run.HeadSHA
 		sctx.ReviewStartingHeadSHA = reviewStartingHeadSHA
+		if stepName == types.StepReview {
+			sctx.ReviewRound = roundNum + 1
+		}
 		outcome, err := step.Execute(sctx)
 		roundNum++
 		roundDuration := time.Since(phaseStart).Milliseconds()
@@ -803,6 +856,11 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		// levels (including "info") get a chance at automatic fixing.
 		if outcome.AutoFixable && autoFixLimit > 0 && autoFixAttempts < autoFixLimit {
 			fixableFindings := autoFixableFindingsJSON(outcome.Findings)
+			if stepName == types.StepReview && roundNum == 2 {
+				// Round 3 is exceptional: only the round-2 reviewer can authorize
+				// it, and only with explicit severe/security evidence.
+				fixableFindings = round3EligibleFindingsJSON(fixableFindings)
+			}
 			if fixableFindings != "" {
 				autoFixAttempts++
 				telemetry.Track("fix", e.fixTelemetryFields("auto", stepName, findingsCount(fixableFindings), autoFixAttempts))
@@ -825,6 +883,14 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 				sctx.Fixing = true
 				sctx.PreviousFindings = fixableFindings
 				nextTrigger = "auto_fix"
+				if stepName == types.StepReview && roundNum >= 3 {
+					invocationRound = 3
+					if err := executeTerminalReviewFix(step, sctx); err != nil {
+						return false, err
+					}
+					writeLog("terminal review round 3 fix applied; no confirmation review will run")
+					goto done
+				}
 				continue
 			}
 		}
@@ -941,6 +1007,12 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			sctx.Fixing = true
 			selectedFindings := filterFindingsJSON(outcome.Findings, response.findingIDs)
 			mergedFindings := mergeUserOverridesJSON(selectedFindings, response.instructions, response.addedFindings)
+			if stepName == types.StepReview && roundNum == 2 {
+				mergedFindings = round3EligibleFindingsJSON(mergedFindings)
+				if mergedFindings == "" {
+					return false, fmt.Errorf("review round 3 refused: round 2 did not surface a selected severe or security finding eligible for the exceptional terminal round")
+				}
+			}
 			sctx.PreviousFindings = mergedFindings
 			nextTrigger = "auto_fix"
 			if currentRoundID != "" {
@@ -958,6 +1030,14 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 				}
 			}
 			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusFixing), "", "", nil)
+			if stepName == types.StepReview && roundNum >= 3 {
+				invocationRound = 3
+				if err := executeTerminalReviewFix(step, sctx); err != nil {
+					return false, err
+				}
+				writeLog("terminal review round 3 fix applied; no confirmation review will run")
+				goto done
+			}
 			slog.Info("step fix requested, re-executing", "step", stepName)
 			continue // loop back to step.Execute
 		}
@@ -990,11 +1070,105 @@ done:
 	return skipRemaining, nil
 }
 
+func executeTerminalReviewFix(step Step, sctx *StepContext) error {
+	fixer, ok := step.(TerminalReviewFixer)
+	if !ok {
+		return fmt.Errorf("review round 3 reached the hard cap and this review step cannot apply a terminal fix without starting round 4")
+	}
+	if _, err := fixer.ExecuteTerminalReviewFix(sctx); err != nil {
+		return fmt.Errorf("terminal review fix: %w", err)
+	}
+	return nil
+}
+
 func roundInsertID(_ string, inserted *db.StepRound, err error) string {
 	if err != nil || inserted == nil {
 		return ""
 	}
 	return inserted.ID
+}
+
+func (e *Executor) agentCandidates(role, fallback string) []string {
+	var configured config.AgentSelection
+	if e.config != nil {
+		switch role {
+		case "reviewer":
+			configured = e.config.AgentRoles.Reviewer
+		case "implementer":
+			configured = e.config.AgentRoles.Implementer
+		}
+	}
+	if len(configured) == 0 {
+		if fallback == "" {
+			return nil
+		}
+		return []string{fallback}
+	}
+	out := make([]string, 0, len(configured))
+	for _, name := range configured {
+		out = append(out, string(name))
+	}
+	return out
+}
+
+type observableRoleAgent struct {
+	inner      agent.Agent
+	role       string
+	candidates []string
+	log        func(string)
+	runID      string
+	stepName   types.StepName
+}
+
+func (a *observableRoleAgent) Name() string { return a.inner.Name() }
+
+func (a *observableRoleAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+	primary := a.inner.Name()
+	fallbacks := []string(nil)
+	if len(a.candidates) > 0 {
+		primary = a.candidates[0]
+		fallbacks = a.candidates[1:]
+	}
+	message := fmt.Sprintf("agent selection: role=%s primary=%s fallbacks=%v", a.role, primary, fallbacks)
+	if a.log != nil {
+		a.log(message)
+	}
+	slog.Info("pipeline agent selected", "run_id", a.runID, "step", a.stepName, "role", a.role, "primary", primary, "fallbacks", fallbacks)
+
+	// Attempt callbacks are the adapter-neutral structured truth for retries
+	// and runtime fallback. Log identity and status only (never the error text,
+	// which can contain command arguments or credentials) so no fallback can be
+	// silent even when the caller did not request streamed chunks.
+	previousAttempt := opts.OnAttempt
+	opts.OnAttempt = func(attempt agent.Attempt) {
+		if previousAttempt != nil {
+			previousAttempt(attempt)
+		}
+		status := "succeeded"
+		if attempt.Err != nil {
+			status = "failed"
+		}
+		line := fmt.Sprintf("agent attempt: role=%s agent=%s status=%s", a.role, attempt.Agent, status)
+		if a.log != nil {
+			a.log(line)
+		}
+		slog.Info("pipeline agent attempt", "run_id", a.runID, "step", a.stepName, "role", a.role, "agent", attempt.Agent, "status", status)
+	}
+	return a.inner.Run(ctx, opts)
+}
+
+func (a *observableRoleAgent) Close() error { return a.inner.Close() }
+func (a *observableRoleAgent) SupportsSessionResume() bool {
+	return agent.SupportsSessionResume(a.inner)
+}
+func (a *observableRoleAgent) SupportsSessionProvider(provider string) bool {
+	return agent.SupportsSessionProvider(a.inner, provider)
+}
+func (a *observableRoleAgent) ReportsAgentAttempts() bool {
+	return agent.ReportsAgentAttempts(a.inner)
+}
+func (a *observableRoleAgent) NeutralizesGateInstructions() bool {
+	return agent.NeutralizesGateInstructions(a.inner)
 }
 
 type gateStepBoundaryAgent struct {
