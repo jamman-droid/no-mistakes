@@ -500,6 +500,7 @@ func cleanReviewScenario(t *testing.T) string {
           description: "looks good"
           action: no-op
           review_scope: source
+          round3_eligible: false
       summary: "no blocking issues"
       risk_level: low
       risk_rationale: "informational finding only"
@@ -518,6 +519,7 @@ func cleanReviewScenario(t *testing.T) string {
           description: "looks good"
           action: no-op
           review_scope: source
+          round3_eligible: false
       summary: "no blocking issues"
       risk_level: low
       risk_rationale: "informational finding only"
