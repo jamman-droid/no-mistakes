@@ -3,6 +3,7 @@ package steps
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -38,6 +39,12 @@ func (m *sessionMockAgent) Run(_ context.Context, opts agent.RunOpts) (*agent.Re
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls = append(m.calls, opts)
+	if opts.Purpose == "review-fix" {
+		path := filepath.Join(opts.CWD, fmt.Sprintf("review-fix-%d.txt", len(m.calls)))
+		if err := os.WriteFile(path, []byte("fixed\n"), 0o644); err != nil {
+			return nil, err
+		}
+	}
 
 	result := m.respond(opts)
 	if opts.Session != nil {
@@ -112,8 +119,8 @@ func fixCalls(calls []agent.RunOpts) []agent.RunOpts {
 // step through the executor's auto-fix loop for multiple rounds and proves:
 // every review turn (the initial review and every post-fix rereview) runs
 // session-free, N fix rounds share ONE durable fixer session, the review
-// turns never receive the fixer's identity, and every review round still asks
-// for a full review pass of the branch.
+// turns never receive the fixer's identity, round 1 covers the branch, and
+// later rounds narrow to the implementer's agreed fixes.
 //
 // Review turns are deliberately session-free: round N's fixes implement round
 // N-1's review findings, so resuming any prior review turn's session would
@@ -129,8 +136,8 @@ func TestReviewLoop_IndependentReviewTurnsOneFixerSession(t *testing.T) {
 			reviewRound++
 			if reviewRound <= 2 {
 				return &agent.Result{Output: []byte(fmt.Sprintf(
-					`{"findings":[{"id":"f-%d","severity":"error","description":"bug %d","action":"auto-fix"}],"summary":"issues","risk_level":"medium","risk_rationale":"bugs"}`,
-					reviewRound, reviewRound,
+					`{"findings":[{"id":"f-%d","severity":"error","description":"bug %d","action":"auto-fix","review_scope":"source","round3_eligible":%t}],"summary":"issues","risk_level":"medium","risk_rationale":"bugs"}`,
+					reviewRound, reviewRound, reviewRound == 2,
 				))}
 			}
 			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean"}`)}
@@ -174,14 +181,15 @@ func TestReviewLoop_IndependentReviewTurnsOneFixerSession(t *testing.T) {
 		t.Fatalf("second fix must resume %s, got %+v", fixerID, fixes[1].Session)
 	}
 
-	// Every review round, including rereviews inside the resumed session,
-	// still demands a full adversarial pass over the branch.
-	for i, call := range reviews {
-		if !strings.Contains(call.Prompt, "Do a full review pass before returning") {
-			t.Fatalf("review round %d prompt lost the full-review demand:\n%s", i+1, call.Prompt)
+	if !strings.Contains(reviews[0].Prompt, "Do a full review pass before returning") {
+		t.Fatalf("round 1 lost the whole-slice review demand:\n%s", reviews[0].Prompt)
+	}
+	for i, call := range reviews[1:] {
+		if !strings.Contains(call.Prompt, "Review only the fixes the implementer agreed with and applied") {
+			t.Fatalf("review round %d is not narrowed to agreed fixes:\n%s", i+2, call.Prompt)
 		}
-		if !strings.Contains(call.Prompt, "Review the code changes") {
-			t.Fatalf("review round %d prompt is not a full review prompt:\n%s", i+1, call.Prompt)
+		if strings.Contains(call.Prompt, "Do a full review pass before returning") {
+			t.Fatalf("review round %d improperly repeats the whole-slice pass:\n%s", i+2, call.Prompt)
 		}
 	}
 
@@ -245,7 +253,7 @@ func TestReviewLoop_RereviewNeverResumesTheSessionThatPrescribedItsFixes(t *test
 
 // TestReviewLoop_ParkRespondFixKeepsRoleSessions parks the review step at an
 // ask-user gate, responds with a fix action, and proves the user-driven fix
-// turn uses the durable fixer session while the follow-up full rereview stays
+// turn uses the durable fixer session while the narrowed follow-up review stays
 // session-free.
 func TestReviewLoop_ParkRespondFixKeepsRoleSessions(t *testing.T) {
 	reviewRound := 0
@@ -297,8 +305,90 @@ func TestReviewLoop_ParkRespondFixKeepsRoleSessions(t *testing.T) {
 	if fixes[0].Session == nil || fixes[0].Session.ID != "" {
 		t.Fatalf("user-driven fix must start the fixer session, got %+v", fixes[0].Session)
 	}
-	if !strings.Contains(reviews[1].Prompt, "Do a full review pass before returning") {
-		t.Fatalf("post-fix rereview lost the full-review demand:\n%s", reviews[1].Prompt)
+	if !strings.Contains(reviews[1].Prompt, "Review only the fixes the implementer agreed with and applied") {
+		t.Fatalf("post-fix rereview was not narrowed to agreed fixes:\n%s", reviews[1].Prompt)
+	}
+}
+
+func TestReviewLoop_RoundThreeRequiresExceptionalRoundTwoFinding(t *testing.T) {
+	reviewRound := 0
+	mock := &sessionMockAgent{}
+	mock.respond = func(opts agent.RunOpts) *agent.Result {
+		switch opts.Purpose {
+		case "review":
+			reviewRound++
+			return &agent.Result{Output: []byte(fmt.Sprintf(
+				`{"findings":[{"id":"f-%d","severity":"warning","description":"routine incomplete fix","action":"auto-fix","review_scope":"source","round3_eligible":false}],"summary":"issue","risk_level":"medium","risk_rationale":"routine"}`,
+				reviewRound,
+			))}
+		case "review-fix":
+			return &agent.Result{Output: []byte(`{"summary":"apply first fix"}`)}
+		default:
+			t.Fatalf("unexpected purpose %q", opts.Purpose)
+			return nil
+		}
+	}
+
+	exec, database, run, repo, workDir := reviewSessionHarness(t, mock, []pipeline.Step{&ReviewStep{}})
+	done := make(chan error, 1)
+	go func() { done <- exec.Execute(context.Background(), run, repo, workDir) }()
+	waitForReviewStatus(t, database, run.ID, types.StepStatusFixReview)
+	if got := len(reviewCalls(mock.snapshot())); got != 2 {
+		t.Fatalf("review calls before gate = %d, want 2 with round 3 refused", got)
+	}
+	if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := len(reviewCalls(mock.snapshot())); got != 2 {
+		t.Fatalf("review calls = %d, want no exceptional round 3", got)
+	}
+}
+
+func TestReviewLoop_TerminalRoundThreeMayFixButNeverReviewsRoundFour(t *testing.T) {
+	reviewRound := 0
+	fixRound := 0
+	mock := &sessionMockAgent{}
+	mock.respond = func(opts agent.RunOpts) *agent.Result {
+		switch opts.Purpose {
+		case "review":
+			reviewRound++
+			eligible := reviewRound == 2
+			return &agent.Result{Output: []byte(fmt.Sprintf(
+				`{"findings":[{"id":"f-%d","severity":"error","description":"round %d defect","action":"auto-fix","review_scope":"source","round3_eligible":%t}],"summary":"issue","risk_level":"high","risk_rationale":"defect"}`,
+				reviewRound, reviewRound, eligible,
+			))}
+		case "review-fix":
+			fixRound++
+			return &agent.Result{Output: []byte(fmt.Sprintf(`{"summary":"apply correction %d"}`, fixRound))}
+		default:
+			t.Fatalf("unexpected purpose %q", opts.Purpose)
+			return nil
+		}
+	}
+
+	exec, database, run, repo, workDir := reviewSessionHarness(t, mock, []pipeline.Step{&ReviewStep{}})
+	if err := exec.Execute(context.Background(), run, repo, workDir); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	calls := mock.snapshot()
+	if got := len(reviewCalls(calls)); got != 3 {
+		t.Fatalf("review calls = %d, want hard cap of 3", got)
+	}
+	if got := len(fixCalls(calls)); got != 3 {
+		t.Fatalf("fix calls = %d, want fixes after rounds 1, 2, and terminal 3", got)
+	}
+	invocations, err := database.GetAgentInvocationsByRun(run.ID)
+	if err != nil {
+		t.Fatalf("get invocations: %v", err)
+	}
+	for _, invocation := range invocations {
+		if invocation.Round > 3 {
+			t.Fatalf("terminal fix was recorded as forbidden round %d: %+v", invocation.Round, invocation)
+		}
 	}
 }
 

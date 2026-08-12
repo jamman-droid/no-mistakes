@@ -71,6 +71,7 @@ type GlobalConfig struct {
 	SourceYAML           []byte              `yaml:"-"`
 	Agent                types.AgentName     `yaml:"agent"`
 	Agents               []types.AgentName   `yaml:"-"`
+	AgentRoles           AgentRoles          `yaml:"agent_roles"`
 	ACPXPath             string              `yaml:"acpx_path"`
 	ACPRegistryOverrides map[string]string   `yaml:"acp_registry_overrides"`
 	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
@@ -104,6 +105,7 @@ type GlobalConfig struct {
 // globalConfigRaw is the on-disk YAML representation with duration as string.
 type globalConfigRaw struct {
 	Agent                agentList           `yaml:"agent"`
+	AgentRoles           AgentRoles          `yaml:"agent_roles"`
 	ACPXPath             string              `yaml:"acpx_path"`
 	ACPRegistryOverrides map[string]string   `yaml:"acp_registry_overrides"`
 	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
@@ -126,10 +128,11 @@ type globalConfigRaw struct {
 type RepoConfig struct {
 	Agent          types.AgentName   `yaml:"agent"`
 	Agents         []types.AgentName `yaml:"-"`
+	AgentRoles     AgentRoles        `yaml:"agent_roles"`
 	Commands       Commands          `yaml:"commands"`
 	IgnorePatterns []string          `yaml:"ignore_patterns"`
 	// AllowRepoCommands opts in to honoring the code-executing selection
-	// fields (commands.{test,lint,format} and agent) from a contributor's
+	// fields (commands.{test,lint,format}, agent, and agent_roles) from a contributor's
 	// pushed branch instead of the trusted default-branch copy. It is read
 	// ONLY from the trusted default-branch copy of .no-mistakes.yaml (never
 	// the pushed SHA), so a contributor cannot self-enable. Default false:
@@ -305,6 +308,7 @@ func RenderedInstructions(instructions string) string {
 func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	type repoConfigRaw struct {
 		Agent                  agentList   `yaml:"agent"`
+		AgentRoles             AgentRoles  `yaml:"agent_roles"`
 		Commands               Commands    `yaml:"commands"`
 		IgnorePatterns         []string    `yaml:"ignore_patterns"`
 		AllowRepoCommands      bool        `yaml:"allow_repo_commands"`
@@ -324,6 +328,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	}
 	c.Agent = firstAgent(raw.Agent)
 	c.Agents = copyAgents(raw.Agent)
+	c.AgentRoles = copyAgentRoles(raw.AgentRoles)
 	c.Commands = raw.Commands
 	c.IgnorePatterns = raw.IgnorePatterns
 	c.AllowRepoCommands = raw.AllowRepoCommands
@@ -393,24 +398,27 @@ type Config struct {
 	CaptureEvalProvenance bool
 	Agent                 types.AgentName
 	Agents                []types.AgentName
-	ACPXPath              string
-	ACPRegistryOverrides  map[string]string
-	AgentPathOverride     map[string]string
-	AgentArgsOverride     map[string][]string
-	CITimeout             time.Duration
-	StepQuietWarning      time.Duration
-	LogLevel              string
-	SessionReuse          bool
-	Eval                  Eval
-	Commands              Commands
-	IgnorePatterns        []string
-	AutoFix               AutoFix
-	CI                    CI
-	Commit                Commit
-	Intent                Intent
-	Test                  Test
-	Document              Document
-	Review                Review
+	// AgentRoles optionally selects independent ordered agent lists for the
+	// reviewer and implementer seats. Empty role selections inherit Agent/Agents.
+	AgentRoles           AgentRoles
+	ACPXPath             string
+	ACPRegistryOverrides map[string]string
+	AgentPathOverride    map[string]string
+	AgentArgsOverride    map[string][]string
+	CITimeout            time.Duration
+	StepQuietWarning     time.Duration
+	LogLevel             string
+	SessionReuse         bool
+	Eval                 Eval
+	Commands             Commands
+	IgnorePatterns       []string
+	AutoFix              AutoFix
+	CI                   CI
+	Commit               Commit
+	Intent               Intent
+	Test                 Test
+	Document             Document
+	Review               Review
 	// DisableProjectSettings is the resolved, trusted-only opt-out (see the
 	// RepoConfig field). When true, gate agents are launched with their
 	// project-level settings/instructions suppressed; the daemon fails the run
@@ -520,9 +528,21 @@ type Intent struct {
 	DisabledReaders map[string]bool
 }
 
-type agentList []types.AgentName
+// AgentSelection is an ordered agent list. YAML accepts either one agent name
+// or a sequence, matching the backward-compatible top-level agent field.
+type AgentSelection []types.AgentName
 
-func (a *agentList) UnmarshalYAML(value *yaml.Node) error {
+type agentList = AgentSelection
+
+// AgentRoles provides role-specific selections. Reviewer is used only for
+// independent review turns. Implementer is used for every other pipeline
+// invocation, including review fixes. An empty role inherits agent.
+type AgentRoles struct {
+	Reviewer    AgentSelection `yaml:"reviewer"`
+	Implementer AgentSelection `yaml:"implementer"`
+}
+
+func (a *AgentSelection) UnmarshalYAML(value *yaml.Node) error {
 	switch value.Kind {
 	case yaml.ScalarNode:
 		name := strings.TrimSpace(value.Value)
@@ -548,6 +568,13 @@ func (a *agentList) UnmarshalYAML(value *yaml.Node) error {
 		return nil
 	default:
 		return fmt.Errorf("agent must be a string or a list of strings")
+	}
+}
+
+func copyAgentRoles(roles AgentRoles) AgentRoles {
+	return AgentRoles{
+		Reviewer:    AgentSelection(copyAgents(roles.Reviewer)),
+		Implementer: AgentSelection(copyAgents(roles.Implementer)),
 	}
 }
 
@@ -603,6 +630,13 @@ const defaultConfigYAML = `# no-mistakes global configuration
 # "acp:cursor" also uses that Cursor default command
 # Use acp:<target> to run an optional user-installed acpx target, for example acp:gemini
 agent: auto
+
+# Optional independent ordered selections. Missing roles inherit agent.
+# reviewer is used only for review turns; implementer is used everywhere else,
+# including review fixes.
+# agent_roles:
+#   reviewer: [codex, claude]
+#   implementer: [claude, codex]
 
 # Optional path to the user-installed acpx binary for acp:<target> agents and ACP aliases
 # acpx_path: acpx
@@ -783,6 +817,58 @@ var probeRovoDevSupport = func(ctx context.Context, bin string) (bool, error) {
 // identity, and kept as fallbacks. The lookPath function should behave like
 // exec.LookPath.
 func (c *Config) ResolveAgent(ctx context.Context, lookPath func(string) (string, error)) error {
+	configuredDefault := c.configuredAgents()
+	configuredRoles := copyAgentRoles(c.AgentRoles)
+	if err := c.resolveDefaultAgent(ctx, lookPath); err != nil {
+		return err
+	}
+	for _, role := range []struct {
+		name      string
+		selection *AgentSelection
+	}{
+		{name: "reviewer", selection: &configuredRoles.Reviewer},
+		{name: "implementer", selection: &configuredRoles.Implementer},
+	} {
+		candidates := AgentSelection(copyAgents(*role.selection))
+		if len(candidates) == 0 || agentSelectionsEqual(candidates, configuredDefault) {
+			resolved := AgentSelection(copyAgents(c.Agents))
+			if role.name == "reviewer" {
+				c.AgentRoles.Reviewer = resolved
+			} else {
+				c.AgentRoles.Implementer = resolved
+			}
+			continue
+		}
+		roleConfig := *c
+		roleConfig.Agent = firstAgent(candidates)
+		roleConfig.Agents = copyAgents(candidates)
+		roleConfig.AgentRoles = AgentRoles{}
+		if err := roleConfig.resolveDefaultAgent(ctx, lookPath); err != nil {
+			return fmt.Errorf("resolve %s agent role: %w", role.name, err)
+		}
+		resolved := AgentSelection(copyAgents(roleConfig.Agents))
+		if role.name == "reviewer" {
+			c.AgentRoles.Reviewer = resolved
+		} else {
+			c.AgentRoles.Implementer = resolved
+		}
+	}
+	return nil
+}
+
+func agentSelectionsEqual(a, b []types.AgentName) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Config) resolveDefaultAgent(ctx context.Context, lookPath func(string) (string, error)) error {
 	candidates := c.configuredAgents()
 	if len(candidates) <= 1 {
 		c.Agent = firstAgent(candidates)
@@ -1234,6 +1320,7 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 		cfg.Agents = copyAgents(raw.Agent)
 		cfg.Agent = firstAgent(cfg.Agents)
 	}
+	cfg.AgentRoles = copyAgentRoles(raw.AgentRoles)
 	if raw.ACPXPath != "" {
 		cfg.ACPXPath = raw.ACPXPath
 	}
@@ -1433,8 +1520,8 @@ func validatePathInstructionGlob(pattern string) error {
 // given a pushed-branch copy and the trusted default-branch copy.
 //
 // The code-executing selection fields - Commands (run verbatim via sh -c on
-// the daemon host) and Agent/Agents (select which processes launch with the
-// maintainer's credentials, including fallback lists and acp: targets) - are
+// the daemon host) and Agent/Agents/AgentRoles (select which processes launch
+// with the maintainer's credentials, including fallback lists and acp: targets) - are
 // taken only from the trusted copy when it is present, so a contributor's
 // pushed branch cannot inject shell or pick an agent. Document (the
 // documentation placement policy injected into the document gate prompt) is
@@ -1451,10 +1538,10 @@ func validatePathInstructionGlob(pattern string) error {
 // When allowRepoCommands is
 // true the maintainer has explicitly opted in (via allow_repo_commands on the
 // TRUSTED default-branch copy) to honoring the pushed branch's commands and
-// agent selection.
-// When there is no trusted copy and the maintainer has not opted in, both
-// fields are forced empty (Agent "" and nil Agents inherit the global agent;
-// Commands{} yields built-in defaults) rather than falling back to the pushed
+// default/role agent selections.
+// When there is no trusted copy and the maintainer has not opted in, all
+// code-executing selections are forced empty (Agent "", nil Agents, and empty
+// AgentRoles inherit global selections; Commands{} yields built-in defaults) rather than falling back to the pushed
 // branch - this blocks the supply-chain vector for repos that ship
 // .no-mistakes.yaml only on feature branches.
 //
@@ -1514,10 +1601,12 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		effective.Commands = trusted.Commands
 		effective.Agent = trusted.Agent
 		effective.Agents = copyAgents(trusted.Agents)
+		effective.AgentRoles = copyAgentRoles(trusted.AgentRoles)
 	} else {
 		effective.Commands = Commands{}
 		effective.Agent = ""
 		effective.Agents = nil
+		effective.AgentRoles = AgentRoles{}
 	}
 	return &effective
 }
@@ -1727,6 +1816,19 @@ func (c *Config) AutoFixLimit(step types.StepName) int {
 	}
 }
 
+func mergedAgentRoleSelection(globalRole, repoRole, base AgentSelection, repoOverridesDefault bool) AgentSelection {
+	if len(repoRole) > 0 {
+		return AgentSelection(copyAgents(repoRole))
+	}
+	if repoOverridesDefault {
+		return AgentSelection(copyAgents(base))
+	}
+	if len(globalRole) > 0 {
+		return AgentSelection(copyAgents(globalRole))
+	}
+	return AgentSelection(copyAgents(base))
+}
+
 // Merge combines global and per-repo config. Per-repo agent values, including
 // ordered fallback lists, override global agent values when non-empty. Commands
 // and ignore patterns come from repo config only.
@@ -1762,6 +1864,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 	cfg := &Config{
 		Agent:                global.Agent,
 		Agents:               copyAgents(global.Agents),
+		AgentRoles:           copyAgentRoles(global.AgentRoles),
 		ACPXPath:             global.ACPXPath,
 		ACPRegistryOverrides: global.ACPRegistryOverrides,
 		AgentPathOverride:    global.AgentPathOverride,
@@ -1788,13 +1891,25 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		NoCI:                   repo.NoCI,
 	}
 
-	if repo.Agent != "" {
+	repoOverridesDefault := repo.Agent != ""
+	if repoOverridesDefault {
 		cfg.Agent = repo.Agent
 		cfg.Agents = copyAgents(repo.Agents)
 		if len(cfg.Agents) == 0 {
 			cfg.Agents = []types.AgentName{repo.Agent}
 		}
 	}
+
+	// Precedence is role-specific repo selection, repo default agent, global
+	// role selection, then global default agent. This preserves the historical
+	// meaning of a repo-level agent override: absent agent_roles, it still
+	// selects every pipeline invocation.
+	base := AgentSelection(copyAgents(cfg.Agents))
+	if len(base) == 0 && cfg.Agent != "" {
+		base = AgentSelection{cfg.Agent}
+	}
+	cfg.AgentRoles.Reviewer = mergedAgentRoleSelection(global.AgentRoles.Reviewer, repo.AgentRoles.Reviewer, base, repoOverridesDefault)
+	cfg.AgentRoles.Implementer = mergedAgentRoleSelection(global.AgentRoles.Implementer, repo.AgentRoles.Implementer, base, repoOverridesDefault)
 
 	return cfg
 }

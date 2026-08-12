@@ -68,6 +68,53 @@ func TestMerge_RepoOverridesAgent(t *testing.T) {
 	}
 }
 
+func TestMerge_AgentRolePrecedence(t *testing.T) {
+	global := &GlobalConfig{
+		Agent:  types.AgentClaude,
+		Agents: []types.AgentName{types.AgentClaude},
+		AgentRoles: AgentRoles{
+			Reviewer:    AgentSelection{types.AgentCodex, types.AgentClaude},
+			Implementer: AgentSelection{types.AgentPi},
+		},
+	}
+
+	t.Run("global role overrides inherit independently", func(t *testing.T) {
+		cfg := Merge(global, &RepoConfig{})
+		assertAgentSelection(t, cfg.AgentRoles.Reviewer, types.AgentCodex, types.AgentClaude)
+		assertAgentSelection(t, cfg.AgentRoles.Implementer, types.AgentPi)
+	})
+
+	t.Run("repo default preserves old all-role override", func(t *testing.T) {
+		cfg := Merge(global, &RepoConfig{Agent: types.AgentRovoDev, Agents: []types.AgentName{types.AgentRovoDev}})
+		assertAgentSelection(t, cfg.AgentRoles.Reviewer, types.AgentRovoDev)
+		assertAgentSelection(t, cfg.AgentRoles.Implementer, types.AgentRovoDev)
+	})
+
+	t.Run("repo role override is most specific", func(t *testing.T) {
+		cfg := Merge(global, &RepoConfig{
+			Agent:  types.AgentRovoDev,
+			Agents: []types.AgentName{types.AgentRovoDev},
+			AgentRoles: AgentRoles{
+				Reviewer: AgentSelection{types.AgentCodex, types.AgentPi},
+			},
+		})
+		assertAgentSelection(t, cfg.AgentRoles.Reviewer, types.AgentCodex, types.AgentPi)
+		assertAgentSelection(t, cfg.AgentRoles.Implementer, types.AgentRovoDev)
+	})
+}
+
+func assertAgentSelection(t *testing.T, got AgentSelection, want ...types.AgentName) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("selection = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("selection = %v, want %v", got, want)
+		}
+	}
+}
+
 func TestMerge_RepoDoesNotOverrideWhenEmpty(t *testing.T) {
 	global := &GlobalConfig{
 		Agent:     types.AgentRovoDev,

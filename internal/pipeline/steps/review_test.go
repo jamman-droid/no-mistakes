@@ -101,8 +101,11 @@ func TestReviewStep_FixMode(t *testing.T) {
 	if !strings.Contains(ag.calls[1].Prompt, `"ask-user"`) {
 		t.Error("expected review prompt to include ask-user action for ambiguous findings")
 	}
-	if !strings.Contains(ag.calls[1].Prompt, "inspect surrounding code, call sites, shared helpers, tests, and invariants") {
-		t.Error("expected review prompt to allow surrounding-code inspection for root cause")
+	if !strings.Contains(ag.calls[1].Prompt, "Inspect the fix-only diff named in review scope and enough surrounding code") {
+		t.Error("expected round-2 prompt to inspect only the agreed fix with enough context to verify it")
+	}
+	if strings.Contains(ag.calls[1].Prompt, "Do a full review pass before returning") {
+		t.Error("expected round-2 prompt not to repeat the whole-slice review")
 	}
 	assertTestQualityRulePrompt(t, ag.calls[1].Prompt)
 	assertTestQualityReviewerAction(t, ag.calls[1].Prompt)
@@ -117,6 +120,45 @@ func TestReviewStep_FixMode(t *testing.T) {
 	}
 	if outcome.ReviewApprovedHeadSHA != sctx.Run.HeadSHA {
 		t.Fatalf("rereview captured approved head %s, want %s", outcome.ReviewApprovedHeadSHA, sctx.Run.HeadSHA)
+	}
+}
+
+func TestReviewStep_RoundTwoPathScopeContainsOnlyAppliedFixes(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+	calls := 0
+	ag := &mockAgent{name: "test", runFn: func(_ context.Context, _ agent.RunOpts) (*agent.Result, error) {
+		calls++
+		if calls == 1 {
+			if err := os.WriteFile(filepath.Join(dir, "review-fix.txt"), []byte("fixed\n"), 0o644); err != nil {
+				return nil, err
+			}
+			return &agent.Result{Output: json.RawMessage(`{"summary":"apply fix"}`)}, nil
+		}
+		return &agent.Result{Output: json.RawMessage(`{"findings":[],"risk_level":"low","risk_rationale":"clean"}`)}, nil
+	}}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Fixing = true
+	sctx.PreviousFindings = `{"findings":[{"id":"f-1","severity":"error","description":"fix it","action":"auto-fix"}]}`
+	sctx.Config.Review.PathInstructions = []config.PathInstruction{
+		{Path: "main.go", Instructions: "WHOLE-SLICE-RULE"},
+		{Path: "review-fix.txt", Instructions: "FIX-ONLY-RULE"},
+	}
+
+	if _, err := (&ReviewStep{}).Execute(sctx); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(ag.calls) != 2 {
+		t.Fatalf("agent calls = %d, want implementer and round-2 reviewer", len(ag.calls))
+	}
+	roundTwoPrompt := ag.calls[1].Prompt
+	if !strings.Contains(roundTwoPrompt, "FIX-ONLY-RULE") {
+		t.Fatalf("round-2 prompt omitted applied-fix rule:\n%s", roundTwoPrompt)
+	}
+	if strings.Contains(roundTwoPrompt, "WHOLE-SLICE-RULE") {
+		t.Fatalf("round-2 prompt leaked original whole-slice scope:\n%s", roundTwoPrompt)
 	}
 }
 
@@ -254,6 +296,7 @@ func TestReviewStep_FixMode_FocusedVerificationContract(t *testing.T) {
 	fixPrompt := ag.calls[0].Prompt
 
 	for _, want := range []string{
+		"Evaluate each finding independently from the code and evidence. Applying a change and declining a finding are equally acceptable outcomes.",
 		"Apply all the fixes you intend to make first; do not run any verification in between individual fixes.",
 		"After all fixes are applied, run one focused verification limited to the changed area (the specific package, file, or test you touched) at the end of the fix round to confirm the fixes hold.",
 		"Do NOT run the complete repository test suite or lint suite during this fix round. The pipeline has dedicated test and lint steps after review that are the authoritative test and lint gates; their coverage may itself be focused on the changed area when the repository has no configured test or lint commands.",
@@ -267,6 +310,11 @@ func TestReviewStep_FixMode_FocusedVerificationContract(t *testing.T) {
 	// must be gone.
 	if strings.Contains(fixPrompt, "Verify that the issues are resolved before finishing") {
 		t.Errorf("fixer prompt still carries the open-ended full-suite verification instruction:\n%s", fixPrompt)
+	}
+	for _, forbidden := range []string{"pushback is expected", "expected to disagree", "disagreement is expected"} {
+		if strings.Contains(strings.ToLower(fixPrompt), forbidden) {
+			t.Errorf("fixer prompt biases the implementer with %q:\n%s", forbidden, fixPrompt)
+		}
 	}
 }
 

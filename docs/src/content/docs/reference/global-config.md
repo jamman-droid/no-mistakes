@@ -10,6 +10,11 @@ Global configuration lives at `~/.no-mistakes/config.yaml`. Set `NM_HOME` to rel
 
 agent: auto
 
+# Optional independent ordered selections. Missing roles inherit agent.
+agent_roles:
+  reviewer: [codex, claude]
+  implementer: [claude, codex]
+
 acpx_path: acpx
 
 acp_registry_overrides:
@@ -73,7 +78,7 @@ test:
 
 ### agent
 
-Default agent for all repos and setup-wizard suggestions. Can be overridden per-repo.
+Default agent for all repos, every pipeline role that has no `agent_roles` override, and setup-wizard suggestions. Can be overridden per-repo.
 
 |         |                                                                                             |
 | ------- | ------------------------------------------------------------------------------------------- |
@@ -101,6 +106,27 @@ After resolving `auto`, entries that resolve to the same ACP target are deduplic
 If no entry is available, the gate fails before its first pipeline step.
 If a pipeline invocation fails because that agent process cannot start or exits with an error, no-mistakes retries that invocation with the next available fallback.
 Structured findings and schema/output validation problems do not trigger fallback.
+Every invocation logs its role, primary selection, and ordered fallbacks. If a fallback is used, the failed and replacement identities are written to the step stream, and each concrete attempt is recorded in the local structured `agent_invocations` table.
+
+### agent_roles
+
+Optional independent ordered selections for the two pipeline seats:
+
+```yaml
+agent_roles:
+  reviewer: [codex, claude]
+  implementer: [claude, codex]
+```
+
+| | |
+| --- | --- |
+| Type | object with optional `reviewer` and `implementer` fields; each is a `string` or `string[]` |
+| Default | Each missing role inherits `agent` |
+
+`reviewer` runs only the independent review turns. `implementer` runs all other agent work, including review fixes, tests, documentation, lint, PR drafting, and CI repairs. Both are ordinary no-mistakes-supervised package agents; one role never shells out to the other.
+
+Each selection uses the same values, availability checks, ordered fallback behavior, path overrides, argument overrides, and project-setting suppression as `agent`.
+At global scope, a role-specific selection overrides the global `agent` only for that role. A repository-level `agent` retains its historical meaning and overrides both global roles; a repository-level `agent_roles.<role>` is most specific.
 
 ### acpx_path
 
@@ -285,8 +311,8 @@ Per-run agent session reuse for the review loop's fixer role.
 | Type    | `bool` |
 | Default | `true` |
 
-When enabled and the pipeline agent supports native session resume (claude via `--resume`, codex via `exec resume`), each run keeps one durable fixer session across its review-fix turns.
-Review turns - the initial full review and every full rereview - always run as fresh, session-free invocations regardless of this setting: a rereview certifies fixes that implement the previous review turn's findings, so it must never resume the session that prescribed them; cross-round review context travels only in the explicit sanitized round history.
+When enabled and the implementer agent supports native session resume (claude via `--resume`, codex via `exec resume`), each run keeps one durable fixer session across its review-fix turns.
+Review turns always run as fresh, session-free invocations regardless of this setting: round 1 examines the relevant slice, while rounds 2 and the exceptional terminal round 3 independently verify only agreed fixes. A reviewer must never resume the implementer session whose work it certifies; cross-round context travels only in explicit sanitized round history.
 The fixer session is never lent to review turns, other pipeline steps stay session-isolated in their own cold invocations, and different runs never reuse identities.
 When resume is unavailable or fails, the fix turn falls back to a cold run or a fresh fixer session and the fallback is recorded in the local `agent_invocations` performance record.
 Session identities are persisted only as minimum local resume metadata, never as prompts or transcripts.
@@ -298,6 +324,7 @@ Set `false` to force every agent invocation cold.
 Maximum follow-up auto-fix attempts per step. Set a step to `0` to disable the follow-up auto-fix loop, so findings require manual approval.
 The document step attempts documentation fixes during its initial pass, so unresolved documentation findings pause for approval instead of using an automatic follow-up loop.
 For empty `commands.lint`, the document step's combined housekeeping pass also attempts safe lint fixes, and the lint step consumes its result; unresolved blocking lint findings then pause for approval instead of starting another automatic fix loop.
+Review is additionally bounded by its three-review protocol. Values above `3` cannot create reviewer round 4; round 2 opens round 3 only for an explicitly eligible severe correctness or security finding, and a terminal round-3 fix has no confirmation review.
 
 |      |          |
 | ---- | -------- |

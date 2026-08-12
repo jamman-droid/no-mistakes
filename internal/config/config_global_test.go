@@ -213,6 +213,31 @@ log_level: "debug"
 	}
 }
 
+func TestLoadGlobal_AgentRolesAcceptOrderedSelections(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := `agent: claude
+agent_roles:
+  reviewer: [codex, claude]
+  implementer: pi
+`
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadGlobal(path)
+	if err != nil {
+		t.Fatalf("LoadGlobal: %v", err)
+	}
+	assertAgentSelection(t, cfg.AgentRoles.Reviewer, types.AgentCodex, types.AgentClaude)
+	assertAgentSelection(t, cfg.AgentRoles.Implementer, types.AgentPi)
+}
+
+func TestLoadGlobal_AgentRolesRejectUnknownKey(t *testing.T) {
+	_, err := LoadGlobalFromBytes([]byte("agent_roles:\n  fixer: codex\n"))
+	if err == nil || !strings.Contains(err.Error(), "field fixer not found") {
+		t.Fatalf("error = %v, want unknown agent_roles key", err)
+	}
+}
+
 func TestLoadGlobal_AgentAcceptsList(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

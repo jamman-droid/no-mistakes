@@ -74,6 +74,22 @@ func TestRetainMatchingFindingsJSON_DoesNotKeepDistinctDuplicateLines(t *testing
 	}
 }
 
+func TestRound3EligibleFindingsJSONRequiresExplicitMergeBlockingFinding(t *testing.T) {
+	raw := `{"findings":[
+		{"id":"warning","severity":"warning","description":"routine","action":"auto-fix","round3_eligible":true},
+		{"id":"not-selected","severity":"error","description":"severe but not selected","action":"auto-fix"},
+		{"id":"security","severity":"error","description":"security defect","action":"auto-fix","round3_eligible":true}
+	]}`
+	got := round3EligibleFindingsJSON(raw)
+	findings, err := types.ParseFindingsJSON(got)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(findings.Items) != 1 || findings.Items[0].ID != "security" {
+		t.Fatalf("eligible findings = %+v, want only merge-blocking selected finding", findings.Items)
+	}
+}
+
 func TestAutoFixableFindingsJSON_FiltersToAutoFix(t *testing.T) {
 	raw := `{"findings":[{"id":"review-1","severity":"error","description":"bug","action":"auto-fix"},{"id":"review-2","severity":"warning","description":"design choice","action":"ask-user"},{"id":"review-3","severity":"warning","description":"missing check","action":"auto-fix"},{"id":"review-4","severity":"info","description":"note","action":"no-op"}],"risk_level":"medium","risk_rationale":"Mixed."}`
 

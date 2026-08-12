@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
@@ -19,6 +20,30 @@ import (
 )
 
 // --- RunManager integration tests ---
+
+func TestNewPipelineAgentsUsesDistinctRoleSelections(t *testing.T) {
+	cfg := &config.Config{
+		Agent:  types.AgentClaude,
+		Agents: []types.AgentName{types.AgentClaude},
+		AgentRoles: config.AgentRoles{
+			Reviewer:    config.AgentSelection{types.AgentCodex},
+			Implementer: config.AgentSelection{types.AgentClaude},
+		},
+	}
+	set, err := newPipelineAgents(context.Background(), cfg, func(bin string) (string, error) {
+		return "/usr/bin/" + bin, nil
+	})
+	if err != nil {
+		t.Fatalf("newPipelineAgents: %v", err)
+	}
+	defer set.Close()
+	if got := set.Roles.Reviewer.Name(); got != string(types.AgentCodex) {
+		t.Fatalf("reviewer = %q, want codex", got)
+	}
+	if got := set.Roles.Implementer.Name(); got != string(types.AgentClaude) {
+		t.Fatalf("implementer = %q, want claude", got)
+	}
+}
 
 func TestValidateRecoveredSessionProviders_RejectsUnavailableFixerProvider(t *testing.T) {
 	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))

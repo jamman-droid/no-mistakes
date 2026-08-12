@@ -35,6 +35,8 @@ When `commands.lint` is empty, that same invocation is a combined documentation-
 The lint step consumes a usable lint result from that pass instead of starting a second cold agent invocation; when the combined pass is skipped, cannot produce trustworthy structured output, or loses its in-memory result across a daemon restart, lint falls back to its own agent pass.
 Unresolved documentation findings and unresolved blocking lint findings pause for approval instead of entering another automatic fix loop.
 
+Review has a stricter bounded protocol than the generic diagram: round 1 reviews the whole relevant slice, round 2 verifies only fixes the implementer agreed with and applied, and round 3 exists only for a severe correctness or security defect surfaced by round 2. Round 3 is terminal. Its findings may be applied by the implementer, but there is no confirmation pass and no round 4, regardless of a larger `auto_fix.review` value or a manual fix action.
+
 ## Before the agent: deterministic CI reruns
 
 The CI step has one cheaper option than a fix round, and it tries it first.
@@ -91,7 +93,7 @@ The agent receives the merged fix payload for that round: the selected agent fin
 That history includes which finding IDs were selected for a prior fix attempt, which findings were left unselected by the user, and any one-line summaries from earlier fix commits.
 On follow-up review passes, that history tells the agent not to re-report user-ignored findings unless the code now presents a materially different issue.
 
-After a user-triggered fix, the step re-runs and pauses again to show you the results (`fix_review` status). You can then approve, fix again, skip, or abort.
+After a user-triggered fix, the step normally re-runs and pauses again to show you the results (`fix_review` status). Review remains subject to its separate three-review cap: a routine round-2 finding cannot open round 3, and a terminal round-3 fix has no confirmation pass. You can then approve, fix where the cap permits, skip, or abort.
 Yolo and AXI `--yes` approve that fix review automatically after their one fix round, so a finding that remains after the fix does not trigger an unbounded fix loop.
 
 ## Fix commits

@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -223,6 +224,62 @@ func TestExecutor_ResumeRestoresParkedGateAndReviewSessions(t *testing.T) {
 	}
 	if resumed.ReviewApprovedHeadSHA == nil || *resumed.ReviewApprovedHeadSHA != "2222222222222222222222222222222222222222" {
 		t.Fatalf("recovered rereview approval = %#v", resumed.ReviewApprovedHeadSHA)
+	}
+}
+
+func TestExecutor_ResumeCannotUseRoutineRoundTwoFindingToOpenRoundThree(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	if err := database.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	stepResult, err := database.InsertStepResult(run.ID, types.StepReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.StartStep(stepResult.ID); err != nil {
+		t.Fatal(err)
+	}
+	findings := `{"findings":[{"id":"review-2","severity":"warning","description":"routine incomplete fix","action":"ask-user","round3_eligible":false}]}`
+	if err := database.SetStepFindings(stepResult.ID, findings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.InsertReviewStepRound(stepResult.ID, 2, "auto_fix", &findings, nil, "2222222222222222222222222222222222222222", 25); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateStepStatusWithDuration(stepResult.ID, types.StepStatusFixReview, 25); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetRunAwaitingAgent(run.ID); err != nil {
+		t.Fatal(err)
+	}
+	run, err = database.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	step := &adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) {
+		calls++
+		return &StepOutcome{}, nil
+	}}
+	exec := NewExecutor(database, p, &config.Config{}, nil, []Step{step}, nil)
+	done := make(chan error, 1)
+	go func() { done <- exec.Resume(context.Background(), run, repo, t.TempDir()) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := exec.Respond(types.StepReview, types.ActionFix, []string{"review-2"}); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("recovered gate never accepted response")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "round 3 refused") {
+		t.Fatalf("resume error = %v, want round-3 refusal", err)
+	}
+	if calls != 0 {
+		t.Fatalf("review step calls = %d, want no round 3", calls)
 	}
 }
 
