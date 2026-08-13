@@ -271,23 +271,23 @@ func newPipelineAgents(ctx context.Context, cfg *config.Config, lookPath func(st
 
 	set := &pipelineAgentSet{}
 	createdBySelection := make(map[string]agent.Agent, 2)
-	createRole := func(role string, names config.AgentSelection) (agent.Agent, error) {
-		keyParts := make([]string, 0, len(names))
-		for _, name := range names {
-			keyParts = append(keyParts, string(name))
+	createRole := func(role string, candidates config.RoleSelection) (agent.Agent, error) {
+		labels := make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			labels = append(labels, candidate.Label())
 		}
-		if len(keyParts) == 0 {
+		if len(labels) == 0 {
 			return nil, fmt.Errorf("%s agent role resolved to an empty selection", role)
 		}
-		key := strings.Join(keyParts, "\x00")
+		key := candidateSelectionKey(candidates)
 		logResolution := func() {
-			slog.Info("pipeline agent role resolved", "role", role, "agents", keyParts, "primary", keyParts[0], "fallbacks", keyParts[1:])
+			slog.Info("pipeline agent role resolved", "role", role, "agents", labels, "primary", labels[0], "fallbacks", labels[1:])
 		}
 		if existing := createdBySelection[key]; existing != nil {
 			logResolution()
 			return existing, nil
 		}
-		created, err := createPipelineAgent(cfg, names)
+		created, err := createPipelineAgent(cfg, candidates)
 		if err != nil {
 			return nil, fmt.Errorf("create %s agent role: %w", role, err)
 		}
@@ -319,13 +319,36 @@ func newPipelineAgent(ctx context.Context, cfg *config.Config, lookPath func(str
 	if err := cfg.ResolveAgent(ctx, lookPath); err != nil {
 		return nil, err
 	}
-	return createPipelineAgent(cfg, config.AgentSelection(cfg.Agents))
+	candidates := make(config.RoleSelection, 0, len(cfg.Agents))
+	for _, name := range cfg.Agents {
+		candidates = append(candidates, config.AgentCandidate{Harness: name})
+	}
+	return createPipelineAgent(cfg, candidates)
 }
 
-func createPipelineAgent(cfg *config.Config, names []types.AgentName) (agent.Agent, error) {
-	created := make([]agent.Agent, 0, len(names))
-	for _, name := range names {
-		next, err := agent.NewWithOptions(name, cfg.AgentPathFor(name), cfg.AgentArgsFor(name), agent.Options{
+func candidateSelectionKey(candidates config.RoleSelection) string {
+	var key strings.Builder
+	for _, candidate := range candidates {
+		key.WriteString(string(candidate.Harness))
+		key.WriteByte(0)
+		key.WriteString(candidate.Provider)
+		key.WriteByte(0)
+		key.WriteString(candidate.Model)
+		for _, arg := range candidate.Args {
+			key.WriteByte(0)
+			key.WriteString(arg)
+		}
+		key.WriteByte(1)
+	}
+	return key.String()
+}
+
+func createPipelineAgent(cfg *config.Config, candidates config.RoleSelection) (agent.Agent, error) {
+	created := make([]agent.Agent, 0, len(candidates))
+	for _, candidate := range candidates {
+		name := candidate.Harness
+		launchArgs := cfg.AgentArgsForCandidate(candidate)
+		next, err := agent.NewWithOptions(name, cfg.AgentPathFor(name), launchArgs, agent.Options{
 			ACPRegistryOverrides:   cfg.ACPRegistryOverrides,
 			DisableProjectSettings: cfg.DisableProjectSettings,
 		})
@@ -333,9 +356,14 @@ func createPipelineAgent(cfg *config.Config, names []types.AgentName) (agent.Age
 			for _, existing := range created {
 				_ = existing.Close()
 			}
-			return nil, fmt.Errorf("create agent %s: %w", name, err)
+			return nil, fmt.Errorf("create agent %s: %w", candidate.Label(), err)
 		}
-		created = append(created, agent.WithSteering(next))
+		steered := agent.WithSteering(next)
+		created = append(created, agent.WithIdentity(steered, agent.Identity{
+			Name:          candidate.Label(),
+			ModelProvider: candidate.Provider,
+			Model:         candidate.Model,
+		}, launchArgs...))
 	}
 	ag := agent.NewFallback(created)
 	// Fail closed ONLY under the trusted opt-out (see startRun): refuse an
@@ -447,7 +475,31 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 }
 
 func agentRolesEqual(a, b config.AgentRoles) bool {
-	return agentListsEqual(a.Reviewer, b.Reviewer) && agentListsEqual(a.Implementer, b.Implementer)
+	return roleSelectionsEqual(a.Reviewer, b.Reviewer) && roleSelectionsEqual(a.Implementer, b.Implementer)
+}
+
+func roleSelectionsEqual(a, b config.RoleSelection) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Harness != b[i].Harness || a[i].Provider != b[i].Provider || a[i].Model != b[i].Model || !stringListsEqual(a[i].Args, b[i].Args) {
+			return false
+		}
+	}
+	return true
+}
+
+func stringListsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func agentListsEqual(a, b []types.AgentName) bool {

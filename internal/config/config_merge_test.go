@@ -73,8 +73,8 @@ func TestMerge_AgentRolePrecedence(t *testing.T) {
 		Agent:  types.AgentClaude,
 		Agents: []types.AgentName{types.AgentClaude},
 		AgentRoles: AgentRoles{
-			Reviewer:    AgentSelection{types.AgentCodex, types.AgentClaude},
-			Implementer: AgentSelection{types.AgentPi},
+			Reviewer:    roleCandidates(types.AgentCodex, types.AgentClaude),
+			Implementer: roleCandidates(types.AgentPi),
 		},
 	}
 
@@ -95,7 +95,7 @@ func TestMerge_AgentRolePrecedence(t *testing.T) {
 			Agent:  types.AgentRovoDev,
 			Agents: []types.AgentName{types.AgentRovoDev},
 			AgentRoles: AgentRoles{
-				Reviewer: AgentSelection{types.AgentCodex, types.AgentPi},
+				Reviewer: roleCandidates(types.AgentCodex, types.AgentPi),
 			},
 		})
 		assertAgentSelection(t, cfg.AgentRoles.Reviewer, types.AgentCodex, types.AgentPi)
@@ -103,14 +103,18 @@ func TestMerge_AgentRolePrecedence(t *testing.T) {
 	})
 }
 
-func assertAgentSelection(t *testing.T, got AgentSelection, want ...types.AgentName) {
+func roleCandidates(names ...types.AgentName) RoleSelection {
+	return roleSelectionFromAgents(names)
+}
+
+func assertAgentSelection(t *testing.T, got RoleSelection, want ...types.AgentName) {
 	t.Helper()
 	if len(got) != len(want) {
 		t.Fatalf("selection = %v, want %v", got, want)
 	}
 	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("selection = %v, want %v", got, want)
+		if got[i].Harness != want[i] || got[i].Provider != "" || got[i].Model != "" || len(got[i].Args) != 0 {
+			t.Fatalf("selection = %v, want legacy candidates %v", got, want)
 		}
 	}
 }

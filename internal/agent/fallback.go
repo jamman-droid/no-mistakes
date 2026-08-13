@@ -131,6 +131,9 @@ func isAgentUnavailableError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if classified, ok := err.(interface{ agentUnavailable() bool }); ok {
+		return classified.agentUnavailable()
+	}
 	msg := strings.ToLower(err.Error())
 	unavailable := []string{
 		" start:",

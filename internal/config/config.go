@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -398,7 +399,7 @@ type Config struct {
 	CaptureEvalProvenance bool
 	Agent                 types.AgentName
 	Agents                []types.AgentName
-	// AgentRoles optionally selects independent ordered agent lists for the
+	// AgentRoles optionally selects independent ordered candidates for the
 	// reviewer and implementer seats. Empty role selections inherit Agent/Agents.
 	AgentRoles           AgentRoles
 	ACPXPath             string
@@ -528,18 +529,35 @@ type Intent struct {
 	DisabledReaders map[string]bool
 }
 
-// AgentSelection is an ordered agent list. YAML accepts either one agent name
-// or a sequence, matching the backward-compatible top-level agent field.
+// AgentSelection is the backward-compatible top-level ordered agent-name list.
+// YAML accepts either one name or a sequence.
 type AgentSelection []types.AgentName
 
 type agentList = AgentSelection
+
+// AgentCandidate is one role-specific seat. Harness selects the adapter;
+// Provider and Model preserve the declared serving identity; Args are appended
+// to the global harness argument override for this candidate only. Provider and
+// Model are observability declarations rather than generic CLI flags: Args
+// carries the exact harness-specific launch flags.
+type AgentCandidate struct {
+	Harness  types.AgentName `yaml:"harness"`
+	Provider string          `yaml:"provider,omitempty"`
+	Model    string          `yaml:"model,omitempty"`
+	Args     []string        `yaml:"args,omitempty"`
+}
+
+// RoleSelection is an ordered role-candidate list. Each YAML entry may be a
+// legacy harness-name string or a structured AgentCandidate. A single string or
+// mapping is accepted as a one-candidate selection.
+type RoleSelection []AgentCandidate
 
 // AgentRoles provides role-specific selections. Reviewer is used only for
 // independent review turns. Implementer is used for every other pipeline
 // invocation, including review fixes. An empty role inherits agent.
 type AgentRoles struct {
-	Reviewer    AgentSelection `yaml:"reviewer"`
-	Implementer AgentSelection `yaml:"implementer"`
+	Reviewer    RoleSelection `yaml:"reviewer"`
+	Implementer RoleSelection `yaml:"implementer"`
 }
 
 func (a *AgentSelection) UnmarshalYAML(value *yaml.Node) error {
@@ -571,10 +589,141 @@ func (a *AgentSelection) UnmarshalYAML(value *yaml.Node) error {
 	}
 }
 
+func (s *RoleSelection) UnmarshalYAML(value *yaml.Node) error {
+	var nodes []*yaml.Node
+	switch value.Kind {
+	case yaml.ScalarNode:
+		if strings.TrimSpace(value.Value) == "" {
+			*s = nil
+			return nil
+		}
+		nodes = []*yaml.Node{value}
+	case yaml.MappingNode:
+		nodes = []*yaml.Node{value}
+	case yaml.SequenceNode:
+		nodes = value.Content
+	default:
+		return fmt.Errorf("agent role must be a string, candidate object, or a list of them")
+	}
+	selection := make(RoleSelection, 0, len(nodes))
+	for i, node := range nodes {
+		candidate, err := decodeAgentCandidate(node)
+		if err != nil {
+			return fmt.Errorf("candidate[%d]: %w", i, err)
+		}
+		selection = append(selection, candidate)
+	}
+	*s = selection
+	return nil
+}
+
+func decodeAgentCandidate(node *yaml.Node) (AgentCandidate, error) {
+	if node.Kind == yaml.ScalarNode {
+		name := strings.TrimSpace(node.Value)
+		if name == "" {
+			return AgentCandidate{}, fmt.Errorf("harness must not be empty")
+		}
+		return AgentCandidate{Harness: types.AgentName(name)}, nil
+	}
+	if node.Kind != yaml.MappingNode {
+		return AgentCandidate{}, fmt.Errorf("must be a harness-name string or candidate object")
+	}
+	allowed := map[string]bool{"harness": true, "provider": true, "model": true, "args": true}
+	present := make(map[string]bool, len(node.Content)/2)
+	for i := 0; i < len(node.Content); i += 2 {
+		key := node.Content[i].Value
+		if !allowed[key] {
+			return AgentCandidate{}, fmt.Errorf("unknown field %q", key)
+		}
+		if present[key] {
+			return AgentCandidate{}, fmt.Errorf("field %q is duplicated", key)
+		}
+		present[key] = true
+	}
+	var candidate AgentCandidate
+	if err := node.Decode(&candidate); err != nil {
+		return AgentCandidate{}, err
+	}
+	candidate.Harness = types.AgentName(strings.TrimSpace(string(candidate.Harness)))
+	candidate.Provider = strings.TrimSpace(candidate.Provider)
+	candidate.Model = strings.TrimSpace(candidate.Model)
+	candidate.Args = append([]string(nil), candidate.Args...)
+	if candidate.Harness == "" {
+		return AgentCandidate{}, fmt.Errorf("harness must not be empty")
+	}
+	if present["provider"] && candidate.Provider == "" {
+		return AgentCandidate{}, fmt.Errorf("provider must not be empty")
+	}
+	if present["model"] && candidate.Model == "" {
+		return AgentCandidate{}, fmt.Errorf("model must not be empty")
+	}
+	if candidate.Provider != "" && !safeAgentIdentityToken(candidate.Provider) {
+		return AgentCandidate{}, fmt.Errorf("provider %q is not a safe identity token", candidate.Provider)
+	}
+	if candidate.Model != "" && !safeAgentIdentityToken(candidate.Model) {
+		return AgentCandidate{}, fmt.Errorf("model %q is not a safe identity token", candidate.Model)
+	}
+	if len(candidate.Args) > 0 {
+		if err := validateCandidateArgs(candidate); err != nil {
+			return AgentCandidate{}, err
+		}
+	}
+	return candidate, nil
+}
+
+func safeAgentIdentityToken(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._-/:+@", r) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// Label is the bounded, argument-redacted candidate identity used in logs,
+// session ownership, fallback attempts, and durable invocation records.
+func (c AgentCandidate) Label() string {
+	if c.Provider == "" && c.Model == "" && len(c.Args) == 0 {
+		return string(c.Harness)
+	}
+	label := fmt.Sprintf("candidate[harness=%q;provider=%q;model=%q", string(c.Harness), c.Provider, c.Model)
+	if len(c.Args) > 0 {
+		label += ";args=" + candidateArgsFingerprint(c.Args)[:24]
+	}
+	return label + "]"
+}
+
+func copyRoleSelection(selection RoleSelection) RoleSelection {
+	if len(selection) == 0 {
+		return nil
+	}
+	out := make(RoleSelection, len(selection))
+	for i, candidate := range selection {
+		out[i] = candidate
+		out[i].Args = append([]string(nil), candidate.Args...)
+	}
+	return out
+}
+
+func roleSelectionFromAgents(names []types.AgentName) RoleSelection {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make(RoleSelection, 0, len(names))
+	for _, name := range names {
+		out = append(out, AgentCandidate{Harness: name})
+	}
+	return out
+}
+
 func copyAgentRoles(roles AgentRoles) AgentRoles {
 	return AgentRoles{
-		Reviewer:    AgentSelection(copyAgents(roles.Reviewer)),
-		Implementer: AgentSelection(copyAgents(roles.Implementer)),
+		Reviewer:    copyRoleSelection(roles.Reviewer),
+		Implementer: copyRoleSelection(roles.Implementer),
 	}
 }
 
@@ -633,9 +782,15 @@ agent: auto
 
 # Optional independent ordered selections. Missing roles inherit agent.
 # reviewer is used only for review turns; implementer is used everywhere else,
-# including review fixes.
+# including review fixes. Entries may be harness names or structured candidates;
+# provider/model are observable identity and args are harness-specific launch flags.
 # agent_roles:
-#   reviewer: [codex, claude]
+#   reviewer:
+#     - harness: pi
+#       provider: openai
+#       model: gpt-5.4
+#       args: [--provider, openai, --model, gpt-5.4]
+#     - claude
 #   implementer: [claude, codex]
 
 # Optional path to the user-installed acpx binary for acp:<target> agents and ACP aliases
@@ -811,11 +966,12 @@ var probeRovoDevSupport = func(ctx context.Context, bin string) (bool, error) {
 	return false, fmt.Errorf("probe rovodev support via %q: %w", bin, err)
 }
 
-// ResolveAgent resolves configured agent names to available agents. A single
-// explicit agent must be runnable; auto probes native agents, then ACP aliases;
-// an ordered list is filtered to available agents, deduplicated by resolved
-// identity, and kept as fallbacks. The lookPath function should behave like
-// exec.LookPath.
+// ResolveAgent resolves configured agent names and role candidates to available
+// harnesses. A single explicit top-level agent must be runnable; auto probes
+// native agents, then ACP aliases. Ordered selections are filtered to available
+// harnesses and deduplicated by their full resolved identity, so two structured
+// candidates using one harness but different models or arguments remain
+// distinct. The lookPath function should behave like exec.LookPath.
 func (c *Config) ResolveAgent(ctx context.Context, lookPath func(string) (string, error)) error {
 	configuredDefault := c.configuredAgents()
 	configuredRoles := copyAgentRoles(c.AgentRoles)
@@ -824,14 +980,14 @@ func (c *Config) ResolveAgent(ctx context.Context, lookPath func(string) (string
 	}
 	for _, role := range []struct {
 		name      string
-		selection *AgentSelection
+		selection *RoleSelection
 	}{
 		{name: "reviewer", selection: &configuredRoles.Reviewer},
 		{name: "implementer", selection: &configuredRoles.Implementer},
 	} {
-		candidates := AgentSelection(copyAgents(*role.selection))
-		if len(candidates) == 0 || agentSelectionsEqual(candidates, configuredDefault) {
-			resolved := AgentSelection(copyAgents(c.Agents))
+		candidates := copyRoleSelection(*role.selection)
+		if len(candidates) == 0 || roleSelectionMatchesAgents(candidates, configuredDefault) {
+			resolved := roleSelectionFromAgents(c.Agents)
 			if role.name == "reviewer" {
 				c.AgentRoles.Reviewer = resolved
 			} else {
@@ -839,14 +995,10 @@ func (c *Config) ResolveAgent(ctx context.Context, lookPath func(string) (string
 			}
 			continue
 		}
-		roleConfig := *c
-		roleConfig.Agent = firstAgent(candidates)
-		roleConfig.Agents = copyAgents(candidates)
-		roleConfig.AgentRoles = AgentRoles{}
-		if err := roleConfig.resolveDefaultAgent(ctx, lookPath); err != nil {
+		resolved, err := c.resolveRoleSelection(ctx, candidates, lookPath)
+		if err != nil {
 			return fmt.Errorf("resolve %s agent role: %w", role.name, err)
 		}
-		resolved := AgentSelection(copyAgents(roleConfig.Agents))
 		if role.name == "reviewer" {
 			c.AgentRoles.Reviewer = resolved
 		} else {
@@ -856,16 +1008,59 @@ func (c *Config) ResolveAgent(ctx context.Context, lookPath func(string) (string
 	return nil
 }
 
-func agentSelectionsEqual(a, b []types.AgentName) bool {
-	if len(a) != len(b) {
+func roleSelectionMatchesAgents(selection RoleSelection, names []types.AgentName) bool {
+	if len(selection) != len(names) {
 		return false
 	}
-	for i := range a {
-		if a[i] != b[i] {
+	for i, candidate := range selection {
+		if candidate.Harness != names[i] || candidate.Provider != "" || candidate.Model != "" || len(candidate.Args) != 0 {
 			return false
 		}
 	}
 	return true
+}
+
+func (c *Config) resolveRoleSelection(ctx context.Context, candidates RoleSelection, lookPath func(string) (string, error)) (RoleSelection, error) {
+	resolved := make(RoleSelection, 0, len(candidates))
+	seen := make(map[string]bool, len(candidates))
+	probed := make([]string, 0, len(candidates))
+	configured := make([]types.AgentName, 0, len(candidates))
+	for _, candidate := range candidates {
+		configured = append(configured, candidate.Harness)
+		name, ok, probe, err := c.resolveConfiguredAgent(ctx, candidate.Harness, lookPath)
+		if probe != "" {
+			probed = append(probed, probe)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		candidate.Harness = name
+		identity := resolvedAgentIdentity(name) + "\x00" + candidate.Provider + "\x00" + candidate.Model + "\x00" + candidateArgsFingerprint(candidate.Args)
+		if seen[identity] {
+			continue
+		}
+		seen[identity] = true
+		resolved = append(resolved, candidate)
+	}
+	if len(resolved) == 0 {
+		return nil, noRunnableAgentError(configured, probed)
+	}
+	return resolved, nil
+}
+
+func candidateArgsFingerprint(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	hash := sha256.New()
+	for _, arg := range args {
+		_, _ = fmt.Fprintf(hash, "%d:", len(arg))
+		_, _ = hash.Write([]byte(arg))
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
 func (c *Config) resolveDefaultAgent(ctx context.Context, lookPath func(string) (string, error)) error {
@@ -1163,6 +1358,18 @@ func (c *Config) AgentArgsFor(name types.AgentName) []string {
 	return c.AgentArgsOverride[string(name)]
 }
 
+// AgentArgsForCandidate returns a fresh launch-argument slice. The global
+// harness override remains the base for backward compatibility; candidate args
+// are appended so each structured fallback can select its own provider, model,
+// or other harness-specific settings.
+func (c *Config) AgentArgsForCandidate(candidate AgentCandidate) []string {
+	global := c.AgentArgsFor(candidate.Harness)
+	args := make([]string, 0, len(global)+len(candidate.Args))
+	args = append(args, global...)
+	args = append(args, candidate.Args...)
+	return args
+}
+
 // agentArgsOverrideAgents lists native agent names accepted as keys in
 // agent_args_override.
 var agentArgsOverrideAgents = map[string]bool{
@@ -1234,18 +1441,33 @@ func validateAgentArgsOverride(override map[string][]string) error {
 		if !agentArgsOverrideAgents[name] {
 			return fmt.Errorf("invalid agent name in agent_args_override: %q (valid: claude, codex, rovodev, opencode, pi, copilot)", name)
 		}
-		reserved := reservedAgentArgs[name]
-		for i, arg := range args {
-			if strings.TrimSpace(arg) == "" {
-				return fmt.Errorf("invalid agent_args_override.%s[%d]: empty arg", name, i)
-			}
-			base := arg
-			if idx := strings.Index(arg, "="); idx > 0 {
-				base = arg[:idx]
-			}
-			if reserved[base] {
-				return fmt.Errorf("invalid agent_args_override.%s[%d]: %q is managed by no-mistakes and cannot be overridden", name, i, arg)
-			}
+		if err := validateAgentArgs(name, args, "agent_args_override."+name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateCandidateArgs(candidate AgentCandidate) error {
+	name := string(candidate.Harness)
+	if !agentArgsOverrideAgents[name] {
+		return fmt.Errorf("args are not supported for harness %q (valid native harnesses: claude, codex, rovodev, opencode, pi, copilot)", name)
+	}
+	return validateAgentArgs(name, candidate.Args, "args")
+}
+
+func validateAgentArgs(name string, args []string, path string) error {
+	reserved := reservedAgentArgs[name]
+	for i, arg := range args {
+		if strings.TrimSpace(arg) == "" {
+			return fmt.Errorf("invalid %s[%d]: empty arg", path, i)
+		}
+		base := arg
+		if idx := strings.Index(arg, "="); idx > 0 {
+			base = arg[:idx]
+		}
+		if reserved[base] {
+			return fmt.Errorf("invalid %s[%d]: %q is managed by no-mistakes and cannot be overridden", path, i, arg)
 		}
 	}
 	return nil
@@ -1816,22 +2038,22 @@ func (c *Config) AutoFixLimit(step types.StepName) int {
 	}
 }
 
-func mergedAgentRoleSelection(globalRole, repoRole, base AgentSelection, repoOverridesDefault bool) AgentSelection {
+func mergedAgentRoleSelection(globalRole, repoRole, base RoleSelection, repoOverridesDefault bool) RoleSelection {
 	if len(repoRole) > 0 {
-		return AgentSelection(copyAgents(repoRole))
+		return copyRoleSelection(repoRole)
 	}
 	if repoOverridesDefault {
-		return AgentSelection(copyAgents(base))
+		return copyRoleSelection(base)
 	}
 	if len(globalRole) > 0 {
-		return AgentSelection(copyAgents(globalRole))
+		return copyRoleSelection(globalRole)
 	}
-	return AgentSelection(copyAgents(base))
+	return copyRoleSelection(base)
 }
 
 // Merge combines global and per-repo config. Per-repo agent values, including
-// ordered fallback lists, override global agent values when non-empty. Commands
-// and ignore patterns come from repo config only.
+// structured role candidates and ordered fallbacks, override global agent values
+// when non-empty. Commands and ignore patterns come from repo config only.
 func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 	af := autoFixDefaults()
 	applyAutoFixOverrides(&af, &global.AutoFix)
@@ -1904,9 +2126,9 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 	// role selection, then global default agent. This preserves the historical
 	// meaning of a repo-level agent override: absent agent_roles, it still
 	// selects every pipeline invocation.
-	base := AgentSelection(copyAgents(cfg.Agents))
+	base := roleSelectionFromAgents(cfg.Agents)
 	if len(base) == 0 && cfg.Agent != "" {
-		base = AgentSelection{cfg.Agent}
+		base = RoleSelection{{Harness: cfg.Agent}}
 	}
 	cfg.AgentRoles.Reviewer = mergedAgentRoleSelection(global.AgentRoles.Reviewer, repo.AgentRoles.Reviewer, base, repoOverridesDefault)
 	cfg.AgentRoles.Implementer = mergedAgentRoleSelection(global.AgentRoles.Implementer, repo.AgentRoles.Implementer, base, repoOverridesDefault)

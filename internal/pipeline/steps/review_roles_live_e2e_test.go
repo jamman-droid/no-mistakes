@@ -56,8 +56,8 @@ func TestLiveCodexReviewerRoleE2E(t *testing.T) {
 		Agent:  types.AgentCodex,
 		Agents: []types.AgentName{types.AgentCodex},
 		AgentRoles: config.AgentRoles{
-			Reviewer:    config.AgentSelection{types.AgentCodex},
-			Implementer: config.AgentSelection{types.AgentCodex},
+			Reviewer:    config.RoleSelection{{Harness: types.AgentCodex}},
+			Implementer: config.RoleSelection{{Harness: types.AgentCodex}},
 		},
 		Commit: config.Commit{FixMessage: config.DefaultFixMessageTemplate},
 	}

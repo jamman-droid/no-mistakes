@@ -24,7 +24,12 @@ agent: codex
 
 # Optional role-specific overrides; missing roles inherit agent.
 agent_roles:
-  reviewer: [codex, claude]
+  reviewer:
+    - harness: pi
+      provider: openai
+      model: gpt-5.4
+      args: [--provider, openai, --model, gpt-5.4]
+    - claude
   implementer: claude
 
 commands:
@@ -128,15 +133,25 @@ Override the reviewer and/or implementer seat for this repository:
 
 ```yaml
 agent_roles:
-  reviewer: [codex, claude]
+  reviewer:
+    - harness: pi
+      provider: openai
+      model: gpt-5.4
+      args: [--provider, openai, --model, gpt-5.4]
+    - harness: pi
+      provider: anthropic
+      model: claude-opus-4-6
+      args: [--provider, anthropic, --model, claude-opus-4-6]
   implementer: claude
 ```
 
-Each field accepts the same single value or ordered fallback list as [`agent`](#agent). A missing role inherits the effective `agent`. `reviewer` is used only for independent review turns; `implementer` is used for every other agent invocation, including review fixes.
+Each field accepts one legacy harness-name string or structured candidate, or an ordered list mixing both. Legacy strings remain unchanged. The [global `agent_roles` reference](/no-mistakes/reference/global-config/#agent_roles) owns the complete candidate schema, validation, launch-argument ordering, fallback identity, logging, and session-binding behavior.
+
+A missing role inherits the effective `agent`. `reviewer` is used only for independent review turns; `implementer` is used for every other agent invocation, including review fixes.
 
 Precedence for each role is: repository `agent_roles.<role>`, repository `agent`, global `agent_roles.<role>`, then global `agent`. This keeps a pre-existing repository `agent` setting backward compatible: without `agent_roles`, it still selects every invocation.
 
-Like `agent`, this is a code-executing selection field. It is read from the trusted default branch unless `allow_repo_commands` is enabled there. Every invocation logs its role, primary, and fallbacks; runtime fallback transitions name both agents, and concrete attempts are retained in local structured invocation records.
+Like `agent`, this is a code-executing selection field. Its complete candidate objects, including arguments, are read from the trusted default branch unless `allow_repo_commands` is enabled there.
 
 ### allow_repo_commands
 

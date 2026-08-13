@@ -370,6 +370,52 @@ func TestRunSessions_FallbackResumesWithItsActualProvider(t *testing.T) {
 	}
 }
 
+// TestRunSessions_StructuredFallbackPersistsExactCandidateIdentity proves a
+// fixer session belongs to one complete structured seat, not merely its harness.
+func TestRunSessions_StructuredFallbackPersistsExactCandidateIdentity(t *testing.T) {
+	d, run := sessionTestDB(t)
+	firstBase := newFakeSessionAgent()
+	firstBase.name = "pi"
+	firstBase.failNext = errors.New("pi start: first candidate unavailable")
+	secondBase := newFakeSessionAgent()
+	secondBase.name = "pi"
+	first := agent.WithIdentity(firstBase, agent.Identity{
+		Name:          "candidate[harness=\"pi\";provider=\"openai\";model=\"gpt-5.4\";args=first]",
+		ModelProvider: "openai",
+		Model:         "gpt-5.4",
+	})
+	second := agent.WithIdentity(secondBase, agent.Identity{
+		Name:          "candidate[harness=\"pi\";provider=\"openai\";model=\"gpt-5.3\";args=second]",
+		ModelProvider: "openai",
+		Model:         "gpt-5.3",
+	})
+	fallback := agent.NewFallback([]agent.Agent{first, second})
+
+	rs := NewRunSessions(d, run.ID, fallback, true)
+	if _, err := rs.Run(context.Background(), fallback, SessionRoleFixer, agent.RunOpts{Prompt: "fix"}, nil); err != nil {
+		t.Fatalf("initial fixer turn: %v", err)
+	}
+	stored, err := d.GetRunAgentSessions(run.ID)
+	if err != nil {
+		t.Fatalf("stored sessions: %v", err)
+	}
+	if len(stored) != 1 || stored[0].Role != string(SessionRoleFixer) || stored[0].Agent != second.Name() || stored[0].SessionID != "sess-1" {
+		t.Fatalf("stored structured session = %+v", stored)
+	}
+
+	rs = NewRunSessions(d, run.ID, fallback, true)
+	if _, err := rs.Run(context.Background(), fallback, SessionRoleFixer, agent.RunOpts{Prompt: "fix again"}, nil); err != nil {
+		t.Fatalf("resumed fixer turn: %v", err)
+	}
+	if len(firstBase.calls) != 1 {
+		t.Fatalf("first candidate calls = %d, want only its initial failed call", len(firstBase.calls))
+	}
+	last := secondBase.calls[len(secondBase.calls)-1]
+	if last.session == nil || last.session.ID != "sess-1" || last.session.Agent != second.Name() {
+		t.Fatalf("stored session resumed on wrong structured candidate: %+v", last.session)
+	}
+}
+
 // TestRunSessions_AgentChangeDiscardsStoredSession proves a stored identity
 // from a different adapter is never fed to the current one.
 func TestRunSessions_AgentChangeDiscardsStoredSession(t *testing.T) {

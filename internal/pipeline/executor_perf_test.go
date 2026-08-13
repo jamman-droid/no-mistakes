@@ -150,6 +150,51 @@ func TestPerfRecordingAgent_RecordsFallbackAttemptsSeparately(t *testing.T) {
 	}
 }
 
+func TestPerfRecordingAgent_DistinguishesSameHarnessCandidateAttempts(t *testing.T) {
+	database, _, run, _ := setupTest(t)
+	first := agent.WithIdentity(
+		&fallbackUsageAgent{name: "pi", err: errors.New("pi start: unavailable")},
+		agent.Identity{Name: "pi[openai/gpt-5.4]", ModelProvider: "openai", Model: "gpt-5.4"},
+	)
+	second := agent.WithIdentity(
+		&fallbackUsageAgent{name: "pi", result: &agent.Result{}},
+		agent.Identity{Name: "pi[openai/gpt-5.3]", ModelProvider: "openai", Model: "gpt-5.3"},
+	)
+	wrapped := &perfRecordingAgent{
+		inner:    agent.NewFallback([]agent.Agent{first, second}),
+		db:       database,
+		runID:    run.ID,
+		stepName: types.StepReview,
+		round:    func() int { return 1 },
+	}
+
+	if _, err := wrapped.Run(context.Background(), agent.RunOpts{Purpose: "review"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	invocations, err := database.GetAgentInvocationsByRun(run.ID)
+	if err != nil {
+		t.Fatalf("get invocations: %v", err)
+	}
+	if len(invocations) != 2 {
+		t.Fatalf("got %d invocation rows, want 2", len(invocations))
+	}
+	want := []struct {
+		agent    string
+		model    string
+		provider string
+		status   string
+	}{
+		{agent: first.Name(), model: "gpt-5.4", provider: "openai", status: "error"},
+		{agent: second.Name(), model: "gpt-5.3", provider: "openai", status: "ok"},
+	}
+	for i, expectation := range want {
+		got := invocations[i]
+		if got.Agent != expectation.agent || got.Model != expectation.model || got.ModelProvider == nil || *got.ModelProvider != expectation.provider || got.ExitStatus != expectation.status {
+			t.Fatalf("invocation[%d] = %+v, want %+v", i, got, expectation)
+		}
+	}
+}
+
 func TestPerfRecordingAgent_MixedFallbackRecordsActualProviderCold(t *testing.T) {
 	database, _, run, _ := setupTest(t)
 	wrapped := &perfRecordingAgent{

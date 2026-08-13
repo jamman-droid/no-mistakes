@@ -1089,7 +1089,7 @@ func roundInsertID(_ string, inserted *db.StepRound, err error) string {
 }
 
 func (e *Executor) agentCandidates(role, fallback string) []string {
-	var configured config.AgentSelection
+	var configured config.RoleSelection
 	if e.config != nil {
 		switch role {
 		case "reviewer":
@@ -1105,8 +1105,8 @@ func (e *Executor) agentCandidates(role, fallback string) []string {
 		return []string{fallback}
 	}
 	out := make([]string, 0, len(configured))
-	for _, name := range configured {
-		out = append(out, string(name))
+	for _, candidate := range configured {
+		out = append(out, candidate.Label())
 	}
 	return out
 }
