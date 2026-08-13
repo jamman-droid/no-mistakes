@@ -3,7 +3,10 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 )
 
 type identityTestAgent struct {
@@ -21,6 +24,26 @@ func (a *identityTestAgent) Run(_ context.Context, _ RunOpts) (*Result, error) {
 }
 func (a *identityTestAgent) Close() error                { return nil }
 func (a *identityTestAgent) SupportsSessionResume() bool { return a.resumable }
+
+type identityLeakingAgent struct {
+	err error
+}
+
+func (a *identityLeakingAgent) Name() string { return "pi" }
+func (a *identityLeakingAgent) Run(_ context.Context, opts RunOpts) (*Result, error) {
+	now := time.Now()
+	if opts.OnChunk != nil {
+		opts.OnChunk(a.err.Error())
+	}
+	if opts.OnLifecycle != nil {
+		opts.OnLifecycle(LifecycleEvent{Agent: "pi", Phase: LifecyclePhaseExit, Message: a.err.Error()})
+	}
+	if opts.OnAttempt != nil {
+		opts.OnAttempt(Attempt{Agent: "pi", Err: a.err, StartedAt: now, CompletedAt: now})
+	}
+	return nil, a.err
+}
+func (a *identityLeakingAgent) Close() error { return nil }
 
 func TestWithIdentityMakesSameHarnessFallbacksDistinctAndOrdered(t *testing.T) {
 	firstBase := &identityTestAgent{name: "pi", err: errors.New("pi start: first unavailable")}
@@ -46,6 +69,53 @@ func TestWithIdentityMakesSameHarnessFallbacksDistinctAndOrdered(t *testing.T) {
 	}
 	if result.Provider != second.Name() || result.Model != "claude-opus-4-6" || result.ModelProvider != "anthropic" {
 		t.Fatalf("result identity = %+v", result)
+	}
+}
+
+func TestWithIdentityRedactsLaunchArgumentsAtEveryOutputBoundary(t *testing.T) {
+	secretArg := "--api-key=top-secret-value"
+	sentinel := errors.New("unavailable")
+	leaked := fmt.Errorf("pi start: argv %s flag --api-key value top-secret-value: %w", secretArg, sentinel)
+	wrapped := WithIdentity(
+		&identityLeakingAgent{err: leaked},
+		Identity{Name: "pi[provider=openai;model=gpt-5.4]", ModelProvider: "openai", Model: "gpt-5.4"},
+		secretArg,
+	)
+
+	var observed []string
+	_, err := wrapped.Run(context.Background(), RunOpts{
+		OnChunk: func(text string) { observed = append(observed, text) },
+		OnLifecycle: func(event LifecycleEvent) {
+			observed = append(observed, event.Agent, event.Message)
+		},
+		OnAttempt: func(attempt Attempt) {
+			if attempt.Err != nil {
+				observed = append(observed, attempt.Err.Error())
+			}
+		},
+	})
+	if err == nil {
+		t.Fatal("Run error = nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Run error lost wrapped cause: %v", err)
+	}
+	observed = append(observed, err.Error())
+
+	success := WithIdentity(&identityTestAgent{name: "pi", result: &Result{Text: "ok"}}, Identity{Name: "pi[provider=backup]"})
+	_, fallbackErr := NewFallback([]Agent{wrapped, success}).Run(context.Background(), RunOpts{
+		OnChunk: func(text string) { observed = append(observed, text) },
+	})
+	if fallbackErr != nil {
+		t.Fatalf("fallback Run: %v", fallbackErr)
+	}
+
+	for _, text := range observed {
+		for _, secret := range []string{secretArg, "--api-key", "top-secret-value"} {
+			if strings.Contains(text, secret) {
+				t.Fatalf("output %q leaked configured argument token %q", text, secret)
+			}
+		}
 	}
 }
 

@@ -156,6 +156,18 @@ func TestEffectiveRepoConfig_StructuredRoleCandidatesStayTrusted(t *testing.T) {
 	}
 }
 
+func TestAgentCandidateLabelSeparatesProviderAndModelBoundaries(t *testing.T) {
+	providerOnly := AgentCandidate{Harness: types.AgentPi, Provider: "openai/gpt-5.4"}
+	providerAndModel := AgentCandidate{Harness: types.AgentPi, Provider: "openai", Model: "gpt-5.4"}
+
+	if providerOnly.Label() == providerAndModel.Label() {
+		t.Fatalf("candidate labels collide: %q", providerOnly.Label())
+	}
+	if got := (AgentCandidate{Harness: types.AgentPi}).Label(); got != "pi" {
+		t.Fatalf("legacy candidate label = %q, want pi", got)
+	}
+}
+
 func TestAgentCandidateLabelDoesNotExposeArguments(t *testing.T) {
 	candidate := AgentCandidate{
 		Harness:  types.AgentPi,

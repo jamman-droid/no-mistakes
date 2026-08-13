@@ -48,11 +48,12 @@ func TestNewPipelineAgentsUsesDistinctRoleSelections(t *testing.T) {
 
 func TestNewPipelineAgentsRunsSameHarnessCandidatesInDeclaredOrder(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "attempts.log")
+	secretArg := "--api-key=top-secret-value"
 	first := config.AgentCandidate{
 		Harness:  types.AgentPi,
 		Provider: "openai",
 		Model:    "gpt-5.4",
-		Args:     []string{"-test.run=^TestStructuredRoleCandidateHelperProcess$", "--", "first"},
+		Args:     []string{"-test.run=^TestStructuredRoleCandidateHelperProcess$", "--", "first", secretArg},
 	}
 	second := config.AgentCandidate{
 		Harness:  types.AgentPi,
@@ -76,6 +77,8 @@ func TestNewPipelineAgentsRunsSameHarnessCandidatesInDeclaredOrder(t *testing.T)
 	defer set.Close()
 
 	var attempts []agent.Attempt
+	var chunks []string
+	var lifecycle []agent.LifecycleEvent
 	result, err := set.Roles.Reviewer.Run(context.Background(), agent.RunOpts{
 		Prompt: "review",
 		CWD:    t.TempDir(),
@@ -83,7 +86,9 @@ func TestNewPipelineAgentsRunsSameHarnessCandidatesInDeclaredOrder(t *testing.T)
 			"NM_TEST_ROLE_CANDIDATE_HELPER=1",
 			"NM_TEST_ROLE_CANDIDATE_LOG=" + logPath,
 		},
-		OnAttempt: func(attempt agent.Attempt) { attempts = append(attempts, attempt) },
+		OnAttempt:   func(attempt agent.Attempt) { attempts = append(attempts, attempt) },
+		OnChunk:     func(text string) { chunks = append(chunks, text) },
+		OnLifecycle: func(event agent.LifecycleEvent) { lifecycle = append(lifecycle, event) },
 	})
 	if err != nil {
 		t.Fatalf("reviewer Run: %v", err)
@@ -93,6 +98,23 @@ func TestNewPipelineAgentsRunsSameHarnessCandidatesInDeclaredOrder(t *testing.T)
 	}
 	if result.Provider != second.Label() || result.Model != second.Model || result.ModelProvider != second.Provider {
 		t.Fatalf("result identity = %+v", result)
+	}
+	var observed strings.Builder
+	for _, attempt := range attempts {
+		if attempt.Err != nil {
+			observed.WriteString(attempt.Err.Error())
+		}
+	}
+	for _, chunk := range chunks {
+		observed.WriteString(chunk)
+	}
+	for _, event := range lifecycle {
+		observed.WriteString(event.Message)
+	}
+	for _, secret := range []string{secretArg, "--api-key", "top-secret-value"} {
+		if strings.Contains(observed.String(), secret) {
+			t.Fatalf("agent callbacks leaked configured argument token %q: %s", secret, observed.String())
+		}
 	}
 	data, err := os.ReadFile(logPath)
 	if err != nil {
@@ -121,6 +143,7 @@ func TestStructuredRoleCandidateHelperProcess(t *testing.T) {
 	_, _ = fmt.Fprintln(f, seat)
 	_ = f.Close()
 	if seat == "first" {
+		_, _ = fmt.Fprintln(os.Stderr, strings.Join(os.Args, " "))
 		os.Exit(1)
 	}
 	fmt.Println(`{"type":"agent_end","messages":[{"role":"assistant","content":"ok"}]}`)

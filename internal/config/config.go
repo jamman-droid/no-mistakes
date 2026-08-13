@@ -688,13 +688,15 @@ func safeAgentIdentityToken(value string) bool {
 // session ownership, fallback attempts, and durable invocation records.
 func (c AgentCandidate) Label() string {
 	label := string(c.Harness)
-	switch {
-	case c.Provider != "" && c.Model != "":
-		label += "[" + c.Provider + "/" + c.Model + "]"
-	case c.Provider != "":
-		label += "[" + c.Provider + "]"
-	case c.Model != "":
-		label += "[" + c.Model + "]"
+	identity := make([]string, 0, 2)
+	if c.Provider != "" {
+		identity = append(identity, "provider="+c.Provider)
+	}
+	if c.Model != "" {
+		identity = append(identity, "model="+c.Model)
+	}
+	if len(identity) > 0 {
+		label += "[" + strings.Join(identity, ";") + "]"
 	}
 	if len(c.Args) > 0 {
 		hash := sha256.New()

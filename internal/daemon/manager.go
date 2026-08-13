@@ -347,7 +347,8 @@ func createPipelineAgent(cfg *config.Config, candidates config.RoleSelection) (a
 	created := make([]agent.Agent, 0, len(candidates))
 	for _, candidate := range candidates {
 		name := candidate.Harness
-		next, err := agent.NewWithOptions(name, cfg.AgentPathFor(name), cfg.AgentArgsForCandidate(candidate), agent.Options{
+		launchArgs := cfg.AgentArgsForCandidate(candidate)
+		next, err := agent.NewWithOptions(name, cfg.AgentPathFor(name), launchArgs, agent.Options{
 			ACPRegistryOverrides:   cfg.ACPRegistryOverrides,
 			DisableProjectSettings: cfg.DisableProjectSettings,
 		})
@@ -362,7 +363,7 @@ func createPipelineAgent(cfg *config.Config, candidates config.RoleSelection) (a
 			Name:          candidate.Label(),
 			ModelProvider: candidate.Provider,
 			Model:         candidate.Model,
-		}))
+		}, launchArgs...))
 	}
 	ag := agent.NewFallback(created)
 	// Fail closed ONLY under the trusted opt-out (see startRun): refuse an
