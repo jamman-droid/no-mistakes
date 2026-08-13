@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.50.0](https://github.com/jamman-droid/no-mistakes/compare/v1.49.0...v1.50.0) (2026-08-13)
+
+
+### Features
+
+* **config:** add structured agent role candidates ([#2](https://github.com/jamman-droid/no-mistakes/issues/2)) ([4827253](https://github.com/jamman-droid/no-mistakes/commit/4827253f1e441cef339b08d43ea33444fb93454a))
+* **eval:** automatically collect an affordable local corpus ([#711](https://github.com/jamman-droid/no-mistakes/issues/711)) ([366dfce](https://github.com/jamman-droid/no-mistakes/commit/366dfce2673dbd4bc566c58ea6c6a4edb37c4576))
+* support role-specific pipeline agents ([#1](https://github.com/jamman-droid/no-mistakes/issues/1)) ([de90df9](https://github.com/jamman-droid/no-mistakes/commit/de90df936ae41f906a2f64f14ef17282265a6f90))
+
 ## [1.49.0](https://github.com/kunchenguid/no-mistakes/compare/v1.48.0...v1.49.0) (2026-08-11)
 
 
