@@ -68,8 +68,36 @@ func axiScenario(t *testing.T) string {
 // proves the agent-supplied intent is used verbatim (no transcript inference)
 // and that `axi run --yes` auto-approves the gate end to end.
 func branchSyncScenario(t *testing.T) string {
+	return branchSyncScenarioWithRereview(t, false)
+}
+
+func branchSyncParkedRereviewScenario(t *testing.T) string {
+	return branchSyncScenarioWithRereview(t, true)
+}
+
+func branchSyncScenarioWithRereview(t *testing.T, parkRereview bool) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "branch-sync-scenario.yaml")
+	parkedRereview := ""
+	if parkRereview {
+		parkedRereview = `  - match: "Verify agreed review fixes in reviewer round 2"
+    text: "rereview requires a decision"
+    structured:
+      findings:
+        - id: "sync-rereview-1"
+          severity: warning
+          file: "feature.txt"
+          line: 1
+          description: "the fix requires an operator decision"
+          action: ask-user
+          review_scope: source
+          round3_eligible: false
+      summary: "fix requires a decision"
+      risk_level: medium
+      risk_rationale: "the fix needs operator review"
+      risk_scope: source-or-external
+`
+	}
 	content := `actions:
   - match: "Investigate previous review findings"
     text: "fixed unsafe value"
@@ -92,7 +120,7 @@ func branchSyncScenario(t *testing.T) string {
       summary: "found one issue"
       risk_level: medium
       risk_rationale: "the unsafe value needs a guard"
-  - text: "no issues found"
+` + parkedRereview + `  - text: "no issues found"
     structured:
       findings: []
       summary: "no issues found"
@@ -129,23 +157,13 @@ func TestAxiBranchSyncJourney(t *testing.T) {
 	if err != nil {
 		t.Fatalf("review fix: %v\n%s", err, fixOut)
 	}
-	for _, want := range []string{"state: pipeline_owned", "blocked_pipeline_owned", "do not make local follow-up commits"} {
+	for _, want := range []string{"outcome: passed", "branch_sync:", "state: behind", "command: no-mistakes axi sync"} {
 		if !strings.Contains(fixOut, want) {
-			t.Errorf("pre-push output missing %q:\n%s", want, fixOut)
+			t.Errorf("completed fix output missing %q:\n%s", want, fixOut)
 		}
 	}
 	if got := strings.TrimSpace(h.WorktreeRefSHA("feature/sync-journey")); got != originalHead {
 		t.Fatalf("operator branch moved before explicit sync: %s != %s", got, originalHead)
-	}
-
-	doneOut, err := h.RunInDir(operator, "axi", "respond", "--action", "approve")
-	if err != nil {
-		t.Fatalf("approve fix review: %v\n%s", err, doneOut)
-	}
-	for _, want := range []string{"outcome: passed", "branch_sync:", "state: behind", "command: no-mistakes axi sync"} {
-		if !strings.Contains(doneOut, want) {
-			t.Errorf("post-push output missing %q:\n%s", want, doneOut)
-		}
 	}
 	pushedHead := h.UpstreamBranchSHA("feature/sync-journey")
 	if pushedHead == originalHead {
@@ -193,7 +211,7 @@ func TestAxiBranchSyncJourney(t *testing.T) {
 // worktree remains at its immutable submitted head. A second axi run from that
 // unchanged worktree must reattach without pushing or creating another run.
 func TestAxiRunReattachesAfterManagedFix(t *testing.T) {
-	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: branchSyncScenario(t)})
+	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: branchSyncParkedRereviewScenario(t)})
 	h.CommitChange("init-reattach", "seed.txt", "seed\n", "seed reattach init")
 	initWorktree := h.AddWorktree("init-reattach")
 	if out, err := h.RunInDir(initWorktree, "init"); err != nil {
@@ -325,7 +343,7 @@ func TestAxiRunReattachesAfterManagedFix(t *testing.T) {
 // sync --recover returns custody and fast-forwards to the preserved head, and
 // the operator can then commit and start a fresh run without losing anything.
 func TestAxiCustodyRecoveryJourney(t *testing.T) {
-	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: branchSyncScenario(t)})
+	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: branchSyncParkedRereviewScenario(t)})
 	h.CommitChange("init-recover", "seed.txt", "seed\n", "seed recover init")
 	initWorktree := h.AddWorktree("init-recover")
 	if out, err := h.RunInDir(initWorktree, "init"); err != nil {
@@ -498,6 +516,22 @@ func rebaseCustodyScenario(t *testing.T) string {
       summary: "found one issue"
       risk_level: medium
       risk_rationale: "the feature needs a guard"
+  - match: "Verify agreed review fixes in reviewer round 2"
+    text: "rereview requires a decision"
+    structured:
+      findings:
+        - id: "rebase-rereview-1"
+          severity: warning
+          file: "guard.txt"
+          line: 1
+          description: "the fix requires an operator decision"
+          action: ask-user
+          review_scope: source
+          round3_eligible: false
+      summary: "fix requires a decision"
+      risk_level: medium
+      risk_rationale: "the fix needs operator review"
+      risk_scope: source-or-external
   - text: "no issues found"
     structured:
       findings: []
