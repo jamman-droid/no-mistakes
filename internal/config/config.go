@@ -687,26 +687,14 @@ func safeAgentIdentityToken(value string) bool {
 // Label is the bounded, argument-redacted candidate identity used in logs,
 // session ownership, fallback attempts, and durable invocation records.
 func (c AgentCandidate) Label() string {
-	label := string(c.Harness)
-	identity := make([]string, 0, 2)
-	if c.Provider != "" {
-		identity = append(identity, "provider="+c.Provider)
+	if c.Provider == "" && c.Model == "" && len(c.Args) == 0 {
+		return string(c.Harness)
 	}
-	if c.Model != "" {
-		identity = append(identity, "model="+c.Model)
-	}
-	if len(identity) > 0 {
-		label += "[" + strings.Join(identity, ";") + "]"
-	}
+	label := fmt.Sprintf("candidate[harness=%q;provider=%q;model=%q", string(c.Harness), c.Provider, c.Model)
 	if len(c.Args) > 0 {
-		hash := sha256.New()
-		for _, arg := range c.Args {
-			_, _ = hash.Write([]byte(arg))
-			_, _ = hash.Write([]byte{0})
-		}
-		label += fmt.Sprintf("@%x", hash.Sum(nil)[:12])
+		label += ";args=" + candidateArgsFingerprint(c.Args)[:24]
 	}
-	return label
+	return label + "]"
 }
 
 func copyRoleSelection(selection RoleSelection) RoleSelection {
@@ -1069,8 +1057,8 @@ func candidateArgsFingerprint(args []string) string {
 	}
 	hash := sha256.New()
 	for _, arg := range args {
+		_, _ = fmt.Fprintf(hash, "%d:", len(arg))
 		_, _ = hash.Write([]byte(arg))
-		_, _ = hash.Write([]byte{0})
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil))
 }

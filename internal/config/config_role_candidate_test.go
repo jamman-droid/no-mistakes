@@ -168,6 +168,15 @@ func TestAgentCandidateLabelSeparatesProviderAndModelBoundaries(t *testing.T) {
 	}
 }
 
+func TestAgentCandidateLabelSeparatesHarnessAndStructuredFieldBoundaries(t *testing.T) {
+	embeddedField := AgentCandidate{Harness: "acp:x[provider=openai]"}
+	structuredField := AgentCandidate{Harness: "acp:x", Provider: "openai"}
+
+	if embeddedField.Label() == structuredField.Label() {
+		t.Fatalf("candidate labels collide: %q", embeddedField.Label())
+	}
+}
+
 func TestAgentCandidateLabelDoesNotExposeArguments(t *testing.T) {
 	candidate := AgentCandidate{
 		Harness:  types.AgentPi,

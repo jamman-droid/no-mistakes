@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 )
@@ -59,6 +60,7 @@ func (a *identityAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) 
 	}
 	if previousLifecycle := opts.OnLifecycle; previousLifecycle != nil {
 		opts.OnLifecycle = func(event LifecycleEvent) {
+			event.Agent = a.identity.Name
 			event.Message = a.redactor.redact(event.Message)
 			previousLifecycle(event)
 		}
@@ -158,23 +160,32 @@ func (r argumentRedactor) redact(text string) string {
 }
 
 func (r argumentRedactor) redactError(err error) error {
-	if err == nil {
-		return nil
-	}
-	text := r.redact(err.Error())
-	if text == err.Error() {
+	if err == nil || len(r.tokens) == 0 {
 		return err
 	}
-	return redactedAgentError{text: text, cause: err}
+	return redactedAgentError{
+		text:             r.redact(err.Error()),
+		unavailable:      isAgentUnavailableError(err),
+		canceled:         errors.Is(err, context.Canceled),
+		deadlineExceeded: errors.Is(err, context.DeadlineExceeded),
+	}
 }
 
 type redactedAgentError struct {
-	text  string
-	cause error
+	text             string
+	unavailable      bool
+	canceled         bool
+	deadlineExceeded bool
 }
 
 func (e redactedAgentError) Error() string { return e.text }
-func (e redactedAgentError) Unwrap() error { return e.cause }
+
+func (e redactedAgentError) Is(target error) bool {
+	return target == context.Canceled && e.canceled ||
+		target == context.DeadlineExceeded && e.deadlineExceeded
+}
+
+func (e redactedAgentError) agentUnavailable() bool { return e.unavailable }
 
 func (a *identityAgent) Close() error { return a.redactor.redactError(a.inner.Close()) }
 

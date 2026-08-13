@@ -36,7 +36,7 @@ func (a *identityLeakingAgent) Run(_ context.Context, opts RunOpts) (*Result, er
 		opts.OnChunk(a.err.Error())
 	}
 	if opts.OnLifecycle != nil {
-		opts.OnLifecycle(LifecycleEvent{Agent: "pi", Phase: LifecyclePhaseExit, Message: a.err.Error()})
+		opts.OnLifecycle(LifecycleEvent{Agent: a.err.Error(), Phase: LifecyclePhaseExit, Message: a.err.Error()})
 	}
 	if opts.OnAttempt != nil {
 		opts.OnAttempt(Attempt{Agent: "pi", Err: a.err, StartedAt: now, CompletedAt: now})
@@ -44,6 +44,12 @@ func (a *identityLeakingAgent) Run(_ context.Context, opts RunOpts) (*Result, er
 	return nil, a.err
 }
 func (a *identityLeakingAgent) Close() error { return nil }
+
+type identitySecretError struct {
+	text string
+}
+
+func (e *identitySecretError) Error() string { return e.text }
 
 func TestWithIdentityMakesSameHarnessFallbacksDistinctAndOrdered(t *testing.T) {
 	firstBase := &identityTestAgent{name: "pi", err: errors.New("pi start: first unavailable")}
@@ -74,8 +80,8 @@ func TestWithIdentityMakesSameHarnessFallbacksDistinctAndOrdered(t *testing.T) {
 
 func TestWithIdentityRedactsLaunchArgumentsAtEveryOutputBoundary(t *testing.T) {
 	secretArg := "--api-key=top-secret-value"
-	sentinel := errors.New("unavailable")
-	leaked := fmt.Errorf("pi start: argv %s flag --api-key value top-secret-value: %w", secretArg, sentinel)
+	secretCause := &identitySecretError{text: "top-secret-value"}
+	leaked := fmt.Errorf("pi start: argv %s flag --api-key value top-secret-value: %w", secretArg, secretCause)
 	wrapped := WithIdentity(
 		&identityLeakingAgent{err: leaked},
 		Identity{Name: "pi[provider=openai;model=gpt-5.4]", ModelProvider: "openai", Model: "gpt-5.4"},
@@ -97,8 +103,15 @@ func TestWithIdentityRedactsLaunchArgumentsAtEveryOutputBoundary(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run error = nil")
 	}
-	if !errors.Is(err, sentinel) {
-		t.Fatalf("Run error lost wrapped cause: %v", err)
+	if errors.Is(err, secretCause) {
+		t.Fatal("Run error exposes its secret-bearing cause through errors.Is")
+	}
+	var recovered *identitySecretError
+	if errors.As(err, &recovered) {
+		t.Fatal("Run error exposes its secret-bearing cause through errors.As")
+	}
+	if unwrapped := errors.Unwrap(err); unwrapped != nil {
+		t.Fatalf("Run error unwrap = %v, want nil", unwrapped)
 	}
 	observed = append(observed, err.Error())
 
@@ -116,6 +129,38 @@ func TestWithIdentityRedactsLaunchArgumentsAtEveryOutputBoundary(t *testing.T) {
 				t.Fatalf("output %q leaked configured argument token %q", text, secret)
 			}
 		}
+	}
+}
+
+func TestWithIdentityRedactedErrorsPreserveContextCancellation(t *testing.T) {
+	secretArg := "--api-key=top-secret-value"
+	wrapped := WithIdentity(
+		&identityTestAgent{name: "pi", err: fmt.Errorf("pi failed with %s: %w", secretArg, context.Canceled)},
+		Identity{Name: "pi[provider=openai]"},
+		secretArg,
+	)
+
+	_, err := wrapped.Run(context.Background(), RunOpts{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context cancellation", err)
+	}
+	if unwrapped := errors.Unwrap(err); unwrapped != nil {
+		t.Fatalf("Run error unwrap = %v, want nil", unwrapped)
+	}
+}
+
+func TestWithIdentityRedactedArgumentDoesNotDisableFallback(t *testing.T) {
+	firstBase := &identityTestAgent{name: "pi", err: errors.New("pi start: first unavailable")}
+	secondBase := &identityTestAgent{name: "pi", result: &Result{Text: "ok"}}
+	first := WithIdentity(firstBase, Identity{Name: "pi[first]"}, "start")
+	second := WithIdentity(secondBase, Identity{Name: "pi[second]"})
+
+	result, err := NewFallback([]Agent{first, second}).Run(context.Background(), RunOpts{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if firstBase.calls != 1 || secondBase.calls != 1 || result.Text != "ok" {
+		t.Fatalf("fallback calls = %d/%d, result = %+v", firstBase.calls, secondBase.calls, result)
 	}
 }
 
