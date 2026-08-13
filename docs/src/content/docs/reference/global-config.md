@@ -146,13 +146,15 @@ A string entry is unchanged from the original role schema and selects that harne
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `harness` | string, required | The same adapter name accepted by `agent` |
-| `provider` | string, optional | Provider-family identity used in selection logs and invocation records |
-| `model` | string, optional | Model identity used in selection logs and invocation records |
-| `args` | string[], optional | Harness-specific CLI arguments for this candidate only |
+| `provider` | string, optional | Declared provider-family identity for observability |
+| `model` | string, optional | Declared model identity for observability |
+| `args` | string[], optional | Native-harness CLI arguments for this candidate only; entries must be non-empty |
 
-`provider` and `model` declare identity; they do not synthesize flags because provider/model flag syntax differs by harness. Put the exact launch flags in `args`, as the Pi example does. Candidate arguments are appended after `agent_args_override.<harness>`, are checked against the same managed-flag restrictions, and are never written raw to selection logs or invocation records. Provider and model are observable, so do not put credentials in those fields.
+`provider` and `model` declare identity; they do not synthesize flags because provider/model flag syntax differs by harness. When present, each must be non-empty, at most 128 ASCII characters, and contain only letters, digits, `.`, `_`, `-`, `/`, `:`, `+`, or `@`. They are intentionally observable, so do not put credentials in these fields. Invocation records keep adapter-reported provider/model values when available and use the declarations when the adapter does not report them.
 
-Availability is still checked by harness. Deduplication uses the complete resolved candidate rather than harness alone, so two Pi candidates with different models or arguments remain distinct and run in declared fallback order. Logs and durable invocation rows use an argument-redacted candidate label plus the provider/model columns; durable sessions are bound to that exact candidate, so a session cannot resume under a different model on the same harness.
+Put the exact launch flags in `args`, as the Pi example does. Candidate arguments are appended after `agent_args_override.<harness>`, are checked against the same managed-flag restrictions, and are never written raw to selection logs, invocation records, or session metadata.
+
+Availability is still checked by harness. Deduplication uses the complete resolved candidate rather than harness alone, so two Pi candidates with different models or arguments remain distinct and run in declared fallback order. The candidate label used in selection and attempt logs, `agent_invocations`, and durable session ownership includes the resolved harness, declared provider/model, and a bounded fingerprint when candidate arguments are present; it never includes the raw arguments. A session therefore cannot resume under a different candidate on the same harness.
 
 Each selection otherwise uses the same availability checks, ordered fallback behavior, path overrides, global argument overrides, and project-setting suppression as `agent`. Per-candidate `args` are supported for native harnesses; ACP candidates continue to use `acp_registry_overrides` and reject `args` rather than silently ignoring them.
 At global scope, a role-specific selection overrides the global `agent` only for that role. A repository-level `agent` retains its historical meaning and overrides both global roles; a repository-level `agent_roles.<role>` is most specific.

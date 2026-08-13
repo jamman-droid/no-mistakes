@@ -191,13 +191,14 @@ The [CLI reference](/no-mistakes/reference/cli/) documents each `axi` command an
 When the daemon is running through a managed service, its `PATH` comes from your login shell environment on macOS and Linux plus common user, Homebrew, and system binary directories; on Windows it reuses the current process environment.
 If native agent discovery does not resolve the binary you expect, check `~/.no-mistakes/logs/daemon.log` and set an explicit override; [Environment the daemon sees](/no-mistakes/reference/environment/#environment-the-daemon-sees) owns the full resolution story.
 
-Five global config fields tune resolution and invocation, and the [Global Config Reference](/no-mistakes/reference/global-config/) owns each one:
+These config fields tune resolution and invocation, and the [Global Config Reference](/no-mistakes/reference/global-config/) owns each one:
 
 - [`agent_path_override`](/no-mistakes/reference/global-config/#agent_path_override) - custom binary paths per native agent, plus the default native binary-name table.
 - [`agent_args_override`](/no-mistakes/reference/global-config/#agent_args_override) - extra CLI flags per native agent for model selection, service tier, reasoning depth, or permission mode, including the reserved-flag rules and smart defaults. Keep it global-only; it reflects your local agent setup rather than repo policy.
 - [`acpx_path`](/no-mistakes/reference/global-config/#acpx_path) - the bridge binary path for explicit ACP targets and first-class ACP aliases.
 - [`acp_registry_overrides`](/no-mistakes/reference/global-config/#acp_registry_overrides) - raw ACP target commands, including replacements for alias defaults such as `cursor-agent acp`, plus their availability-probing rules.
 - [`agent`](/no-mistakes/reference/global-config/#agent) - the `auto` resolution order and ordered fallback-list semantics.
+- [`agent_roles`](/no-mistakes/reference/global-config/#agent_roles) - independent reviewer and implementer candidates, including candidate-specific native launch arguments appended after global argument defaults.
 
 ## Review session reuse
 
@@ -224,7 +225,7 @@ Each invocation returns:
 - **Text** - raw text output
 - **Usage** - token counts (input, output, cache read, cache creation)
 - **SessionID** and **Resumed** - the adapter-native session identity and whether this invocation resumed it, when supported
-- **Model** and **Provider** - adapter-reported serving metadata when available
+- **Model** and **model provider** - adapter-reported serving metadata when available; otherwise, a structured role candidate supplies its declared values
 
 One-shot subprocess agents (Claude, Codex, Pi, Copilot CLI, and acpx) are invocation-scoped.
 After no-mistakes starts one, it terminates any remaining child processes when the invocation exits, fails, or is cancelled, so agent-spawned test workers, build watchers, and dev servers do not survive the step.
@@ -255,36 +256,36 @@ Use `intent.disabled_readers` to disable specific transcript sources, or set `in
 
 ## Claude
 
-Spawns a `claude` subprocess for each invocation with `--output-format stream-json`. The print-mode user prompt is sent as text on stdin rather than placed in the process arguments. By default it also adds `--dangerously-skip-permissions`, unless you already set your own Claude permission flag through `agent_args_override`. Reads JSONL events from stdout. Supports native structured output via `--json-schema`.
+Spawns a `claude` subprocess for each invocation with `--output-format stream-json`. The print-mode user prompt is sent as text on stdin rather than placed in the process arguments. By default it also adds `--dangerously-skip-permissions`, unless the configured global or candidate-specific launch arguments already set a Claude permission flag. Reads JSONL events from stdout. Supports native structured output via `--json-schema`.
 For review-fixer reuse, Claude starts a stream-json session and resumes it with `claude -p --resume <id>`.
 
 ## Codex
 
-Spawns a `codex` subprocess for each invocation with `exec --json`. When structured output is requested, no-mistakes also writes a normalized schema file and passes it with `--output-schema`. By default it also adds `--dangerously-bypass-approvals-and-sandbox`, unless you already set your own Codex approval or sandbox flag through `agent_args_override`. Reads JSONL events. Structured output is returned from the final `agent_message` text, with fallback parsing that accepts JSON fences, inline fence markers, or a final bare JSON object after prose, then validates the result against the normalized schema.
-Codex model and config overrides, such as `-m gpt-5.4`, `-c service_tier="priority"`, or `-c model_reasoning_effort="low"`, belong in global `agent_args_override.codex`.
+Spawns a `codex` subprocess for each invocation with `exec --json`. When structured output is requested, no-mistakes also writes a normalized schema file and passes it with `--output-schema`. By default it also adds `--dangerously-bypass-approvals-and-sandbox`, unless the configured global or candidate-specific launch arguments already set a Codex approval or sandbox flag. Reads JSONL events. Structured output is returned from the final `agent_message` text, with fallback parsing that accepts JSON fences, inline fence markers, or a final bare JSON object after prose, then validates the result against the normalized schema.
+Codex model and config overrides can be global defaults in `agent_args_override.codex` or candidate-specific flags in structured `agent_roles` entries; the references above own their ordering and validation.
 For review-fixer reuse, Codex resumes the reported thread with `codex exec resume <id> <prompt>`.
 That resume command has a narrower flag surface than `codex exec`, so a resume that rejects an override falls back to a fresh fixer session rather than skipping the fix turn.
 
 ## Rovo Dev
 
-Starts a persistent HTTP server (`acli rovodev serve`) on first use and reuses it across invocations. If a reused server refuses a connection, no-mistakes discards it and retries with a fresh server. Any `agent_args_override.rovodev` flags are inserted before no-mistakes' managed serve flags. Communicates via REST API and SSE streaming. Each invocation creates a session, sends the prompt, streams results, then deletes the session. Structured output is handled by injecting schema instructions into a system prompt, then parsing the final text with fallback parsing that accepts JSON fences, inline fence markers, or a final bare JSON object after prose, and validates the result against the requested schema while allowing `null` for optional fields.
+Starts a persistent HTTP server (`acli rovodev serve`) on first use and reuses it across invocations. If a reused server refuses a connection, no-mistakes discards it and retries with a fresh server. Configured global and candidate-specific Rovo Dev launch flags are inserted before no-mistakes' managed serve flags. Communicates via REST API and SSE streaming. Each invocation creates a session, sends the prompt, streams results, then deletes the session. Structured output is handled by injecting schema instructions into a system prompt, then parsing the final text with fallback parsing that accepts JSON fences, inline fence markers, or a final bare JSON object after prose, and validates the result against the requested schema while allowing `null` for optional fields.
 
 ## OpenCode
 
-Starts a persistent HTTP server (`opencode serve`) on first use and reuses it across invocations. If a reused server refuses a connection, no-mistakes discards it and retries with a fresh server. Any `agent_args_override.opencode` flags are inserted before no-mistakes' managed serve flags. Similar session lifecycle to Rovo Dev: create session, send message, stream SSE events until idle, delete session. Supports `json_schema` format in the message request for structured output, with `retryCount: 2` so the model gets a second chance to emit a structured response. When opencode reports `info.error.name = "StructuredOutputError"` (the model did not call the StructuredOutput tool after those retries), no-mistakes surfaces a clean error including the retry count rather than falling through to text-parsing the streamed reasoning prose. When native structured output is genuinely absent, it falls back to parsing the final text with the same JSON fence and bare-object fallback, validating that fallback result against the requested schema while allowing `null` for optional fields.
+Starts a persistent HTTP server (`opencode serve`) on first use and reuses it across invocations. If a reused server refuses a connection, no-mistakes discards it and retries with a fresh server. Configured global and candidate-specific OpenCode launch flags are inserted before no-mistakes' managed serve flags. Similar session lifecycle to Rovo Dev: create session, send message, stream SSE events until idle, delete session. Supports `json_schema` format in the message request for structured output, with `retryCount: 2` so the model gets a second chance to emit a structured response. When opencode reports `info.error.name = "StructuredOutputError"` (the model did not call the StructuredOutput tool after those retries), no-mistakes surfaces a clean error including the retry count rather than falling through to text-parsing the streamed reasoning prose. When native structured output is genuinely absent, it falls back to parsing the final text with the same JSON fence and bare-object fallback, validating that fallback result against the requested schema while allowing `null` for optional fields.
 
 ## Pi
 
 Spawns a `pi` subprocess for each invocation with `--mode json --no-session`.
-See [`agent_args_override`](/no-mistakes/reference/global-config/#agent_args_override) for Pi override precedence.
+The `agent_args_override` and `agent_roles` references above own Pi's global-versus-candidate argument precedence.
 Reads JSONL events from stdout and streams incremental text deltas to the TUI.
 When structured output is requested, no-mistakes injects the JSON schema into the prompt and validates the final text response.
 
 ## Copilot CLI
 
 Spawns a `copilot` subprocess for each invocation with `-p <prompt> --output-format json`.
-It also adds `--no-color` and `--no-ask-user` so the run is non-interactive, plus `--allow-all-tools` (required for non-interactive mode) unless you already set your own Copilot permission flag through `agent_args_override`.
-Any `agent_args_override.copilot` flags are inserted before no-mistakes' managed flags, so user choices such as `--model` or `--effort` take effect.
+It also adds `--no-color` and `--no-ask-user` so the run is non-interactive, plus `--allow-all-tools` (required for non-interactive mode) unless the configured global or candidate-specific launch arguments already set a Copilot permission flag.
+Configured global and candidate-specific Copilot flags are inserted before no-mistakes' managed flags, so user choices such as `--model` or `--effort` take effect.
 Reads JSONL events from stdout, streaming incremental `assistant.message_delta` text to the TUI and capturing the final `assistant.message` content.
 The Copilot CLI has no output-schema flag, so when structured output is requested no-mistakes injects the JSON schema into the prompt and validates the final text response with the same JSON fence and bare-object fallback used by Pi and Rovo Dev.
 

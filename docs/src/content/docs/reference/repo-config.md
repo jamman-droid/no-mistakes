@@ -145,13 +145,13 @@ agent_roles:
   implementer: claude
 ```
 
-Each field accepts one legacy harness-name string or structured candidate, or an ordered list mixing both. A structured candidate has a required `harness` plus optional observable `provider` and `model` identity and candidate-specific `args`. Provider/model fields do not generate harness flags; `args` carries the exact launch flags and is appended after the global `agent_args_override.<harness>`. Raw arguments are never logged or persisted. See the [global `agent_roles` reference](/no-mistakes/reference/global-config/#agent_roles) for the full candidate schema and validation rules.
+Each field accepts one legacy harness-name string or structured candidate, or an ordered list mixing both. Legacy strings remain unchanged. The [global `agent_roles` reference](/no-mistakes/reference/global-config/#agent_roles) owns the complete candidate schema, validation, launch-argument ordering, fallback identity, logging, and session-binding behavior.
 
-A missing role inherits the effective `agent`. `reviewer` is used only for independent review turns; `implementer` is used for every other agent invocation, including review fixes. Two candidates may use the same harness with different provider, model, or arguments: they remain separate, execute in list order, and have distinct argument-redacted labels in attempt logs and durable invocation records.
+A missing role inherits the effective `agent`. `reviewer` is used only for independent review turns; `implementer` is used for every other agent invocation, including review fixes.
 
 Precedence for each role is: repository `agent_roles.<role>`, repository `agent`, global `agent_roles.<role>`, then global `agent`. This keeps a pre-existing repository `agent` setting backward compatible: without `agent_roles`, it still selects every invocation.
 
-Like `agent`, this is a code-executing selection field. Its complete candidate objects, including arguments, are read from the trusted default branch unless `allow_repo_commands` is enabled there. Every invocation logs its role, primary, and fallbacks; runtime fallback transitions name both candidates, and concrete attempts are retained in local structured invocation records.
+Like `agent`, this is a code-executing selection field. Its complete candidate objects, including arguments, are read from the trusted default branch unless `allow_repo_commands` is enabled there.
 
 ### allow_repo_commands
 
