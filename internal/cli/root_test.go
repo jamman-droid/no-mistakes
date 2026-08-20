@@ -287,19 +287,27 @@ func TestRootYesStopsWaitingForRunWhenContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// The wizard cancels mid-flight, so the run it reports as pushed never
+	// registers. What must not happen is the post-wizard wait polling for its
+	// whole registration budget before noticing. Time that wait alone, from
+	// the cancellation onward: the command's own setup (git state detection,
+	// IPC dial, daemon round trips) is unrelated work whose cost varies by an
+	// order of magnitude across CI runners, and including it in the budget is
+	// what made this a false failure on Windows rather than a real regression.
+	var canceledAt time.Time
 	prevAuto := runWizardAuto
 	runWizardAuto = func(got context.Context, p *paths.Paths, state *repoState, _ []types.StepName, _ waitForRunFunc) (wizard.Result, error) {
+		canceledAt = time.Now()
 		cancel()
 		return wizard.Result{Success: true, Pushed: true, TargetBranch: "feat/missing"}, nil
 	}
 	defer func() { runWizardAuto = prevAuto }()
 
-	start := time.Now()
 	_, err = executeCmdWithContext(ctx, "-y")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("executeCmdWithContext(-y) error = %v, want %v", err, context.Canceled)
 	}
-	if elapsed := time.Since(start); elapsed >= time.Second {
-		t.Fatalf("executeCmdWithContext(-y) took %v after cancellation, want under %v", elapsed, time.Second)
+	if elapsed := time.Since(canceledAt); elapsed >= runRegistrationWaitTimeout {
+		t.Fatalf("wait for the registered run took %v after cancellation, want under its %v budget", elapsed, runRegistrationWaitTimeout)
 	}
 }
