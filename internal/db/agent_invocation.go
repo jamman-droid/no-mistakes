@@ -1,6 +1,9 @@
 package db
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Agent invocation session modes recorded for local performance telemetry.
 const (
@@ -43,7 +46,18 @@ type AgentInvocation struct {
 	// step-derived default.
 	Purpose string
 	Agent   string
-	Model   string
+	// Role and candidate identity bind the concrete process attempt to the
+	// redacted startup resolution. Declared fields come from trusted/global
+	// configuration; observed fields are nullable and are populated only when
+	// the adapter actually reports runtime model identity.
+	Role             *string
+	CandidateIndex   *int
+	DeclaredHarness  *string
+	DeclaredProvider *string
+	DeclaredModel    *string
+	ObservedProvider *string
+	ObservedModel    *string
+	Model            string
 	// ModelProvider is the provider that served the model (openai, anthropic,
 	// ...). Nil when the adapter cannot report it.
 	ModelProvider *string
@@ -112,8 +126,9 @@ type AgentInvocation struct {
 
 // agentInvocationColumns is the canonical column order shared by insert and
 // select so the placeholder list and scan destinations cannot drift apart.
-const agentInvocationColumns = `id, run_id, step_name, round, purpose, agent, model, model_provider,
-	session_mode, session_key, fallback_reason,
+const agentInvocationColumns = `id, run_id, step_name, round, purpose, agent,
+	role, candidate_index, declared_harness, declared_provider, declared_model, observed_provider, observed_model,
+	model, model_provider, session_mode, session_key, fallback_reason,
 	started_at, completed_at, duration_ms, subprocess_wait_ms, exit_status, failure_category,
 	input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
 	fresh_input_tokens, reasoning_tokens,
@@ -123,8 +138,9 @@ const agentInvocationColumns = `id, run_id, step_name, round, purpose, agent, mo
 	workload_files, workload_lines, finding_count`
 
 // agentInvocationInsertPlaceholders has one '?' per agentInvocationColumns entry.
-const agentInvocationInsertPlaceholders = `?, ?, ?, ?, ?, ?, ?, ?,
-	?, ?, ?,
+const agentInvocationInsertPlaceholders = `?, ?, ?, ?, ?, ?,
+	?, ?, ?, ?, ?, ?, ?,
+	?, ?, ?, ?, ?,
 	?, ?, ?, ?, ?, ?,
 	?, ?, ?, ?,
 	?, ?,
@@ -140,8 +156,9 @@ func (d *DB) InsertAgentInvocation(inv AgentInvocation) (*AgentInvocation, error
 	_, err := d.sql.Exec(
 		`INSERT INTO agent_invocations (`+agentInvocationColumns+`)
 		 VALUES (`+agentInvocationInsertPlaceholders+`)`,
-		inv.ID, inv.RunID, inv.StepName, inv.Round, inv.Purpose, inv.Agent, inv.Model, inv.ModelProvider,
-		inv.SessionMode, inv.SessionKey, inv.FallbackReason,
+		inv.ID, inv.RunID, inv.StepName, inv.Round, inv.Purpose, inv.Agent,
+		inv.Role, inv.CandidateIndex, inv.DeclaredHarness, inv.DeclaredProvider, inv.DeclaredModel, inv.ObservedProvider, inv.ObservedModel,
+		inv.Model, inv.ModelProvider, inv.SessionMode, inv.SessionKey, inv.FallbackReason,
 		inv.StartedAt, inv.CompletedAt, inv.DurationMS, inv.SubprocessWaitMS, inv.ExitStatus, inv.FailureCategory,
 		inv.InputTokens, inv.OutputTokens, inv.CacheReadTokens, inv.CacheCreationTokens,
 		inv.FreshInputTokens, inv.ReasoningTokens,
@@ -158,8 +175,31 @@ func (d *DB) InsertAgentInvocation(inv AgentInvocation) (*AgentInvocation, error
 
 // GetAgentInvocationsByRun returns a run's invocations in execution order.
 func (d *DB) GetAgentInvocationsByRun(runID string) ([]AgentInvocation, error) {
+	return d.getAgentInvocationsByRun(runID, agentInvocationColumns)
+}
+
+// GetAgentInvocationsByRunForEvidence supports read-only inspection of a
+// pre-Slice-1 database by projecting absent identity columns as NULL.
+func (d *DB) GetAgentInvocationsByRunForEvidence(runID string) ([]AgentInvocation, error) {
+	invocations, err := d.GetAgentInvocationsByRun(runID)
+	if err == nil {
+		return invocations, nil
+	}
+	if strings.Contains(err.Error(), "no such table: agent_invocations") {
+		return []AgentInvocation{}, nil
+	}
+	if !strings.Contains(err.Error(), "no such column:") {
+		return nil, err
+	}
+	legacyColumns := strings.Replace(agentInvocationColumns,
+		"role, candidate_index, declared_harness, declared_provider, declared_model, observed_provider, observed_model,",
+		"NULL AS role, NULL AS candidate_index, NULL AS declared_harness, NULL AS declared_provider, NULL AS declared_model, NULL AS observed_provider, NULL AS observed_model,", 1)
+	return d.getAgentInvocationsByRun(runID, legacyColumns)
+}
+
+func (d *DB) getAgentInvocationsByRun(runID, columns string) ([]AgentInvocation, error) {
 	rows, err := d.sql.Query(
-		`SELECT `+agentInvocationColumns+` FROM agent_invocations WHERE run_id = ? ORDER BY started_at, id`,
+		`SELECT `+columns+` FROM agent_invocations WHERE run_id = ? ORDER BY started_at, id`,
 		runID,
 	)
 	if err != nil {
@@ -167,7 +207,7 @@ func (d *DB) GetAgentInvocationsByRun(runID string) ([]AgentInvocation, error) {
 	}
 	defer rows.Close()
 
-	var invocations []AgentInvocation
+	invocations := make([]AgentInvocation, 0)
 	for rows.Next() {
 		inv, err := scanAgentInvocation(rows)
 		if err != nil {
@@ -185,8 +225,9 @@ type scanner interface {
 func scanAgentInvocation(row scanner) (AgentInvocation, error) {
 	var inv AgentInvocation
 	if err := row.Scan(
-		&inv.ID, &inv.RunID, &inv.StepName, &inv.Round, &inv.Purpose, &inv.Agent, &inv.Model, &inv.ModelProvider,
-		&inv.SessionMode, &inv.SessionKey, &inv.FallbackReason,
+		&inv.ID, &inv.RunID, &inv.StepName, &inv.Round, &inv.Purpose, &inv.Agent,
+		&inv.Role, &inv.CandidateIndex, &inv.DeclaredHarness, &inv.DeclaredProvider, &inv.DeclaredModel, &inv.ObservedProvider, &inv.ObservedModel,
+		&inv.Model, &inv.ModelProvider, &inv.SessionMode, &inv.SessionKey, &inv.FallbackReason,
 		&inv.StartedAt, &inv.CompletedAt, &inv.DurationMS, &inv.SubprocessWaitMS, &inv.ExitStatus, &inv.FailureCategory,
 		&inv.InputTokens, &inv.OutputTokens, &inv.CacheReadTokens, &inv.CacheCreationTokens,
 		&inv.FreshInputTokens, &inv.ReasoningTokens,

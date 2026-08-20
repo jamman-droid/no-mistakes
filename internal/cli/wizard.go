@@ -331,6 +331,11 @@ func awaitDaemonRunRegistration(ctx context.Context, client *ipc.Client, repoID,
 	return nil
 }
 
+// runRegistrationWaitTimeout bounds how long the wizard waits for the daemon
+// to register the run its push triggered. It is the budget waitForActiveRun
+// must abandon early on cancellation rather than spend in full.
+const runRegistrationWaitTimeout = 5 * time.Second
+
 // waitForActiveRun polls the daemon until an active run appears for the given
 // repo/branch, or the deadline elapses. The post-receive hook creates the run
 // asynchronously, so a short poll bridges the gap between push and attach.

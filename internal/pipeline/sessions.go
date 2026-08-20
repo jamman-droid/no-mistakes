@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -91,8 +92,12 @@ func (rs *RunSessions) Run(ctx context.Context, a agent.Agent, role SessionRole,
 		rs.remember(role, result.SessionID, sessionProvider(a, result))
 		return result, nil
 	}
-	if storedID == "" || ctx.Err() != nil {
-		return nil, err
+	var evidenceErr *attemptEvidencePersistenceError
+	if storedID == "" || ctx.Err() != nil || errors.As(err, &evidenceErr) {
+		// errors.As only matches when attempt-evidence persistence was the sole
+		// failure: the turn itself succeeded, so re-running it would duplicate
+		// work rather than recover anything.
+		return result, err
 	}
 
 	// The resume attempt failed. Never skip the turn: drop the dead identity

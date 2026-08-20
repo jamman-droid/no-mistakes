@@ -116,6 +116,7 @@ On startup, the daemon checks for runs that were left in `pending` or `running` 
 
 - Completes legacy active rows whose persisted PR state is already `merged` or `closed`, including their CI step, before active-run recovery and parked-run planning
 - Resumes only fully recorded parked approval gates whose worktree and step history can be validated; incomplete or ambiguous active runs fail closed
+- Declines to resume a parked run whose agent role policy no longer resolves to the snapshot recorded when it started, so an `agent`/`agent_roles` edit made while it was parked cannot silently re-attribute its remaining work to a different candidate; runs started before that snapshot existed are unaffected
 - Before resuming a parked CI gate, re-checks its persisted PR URL through the configured provider; a currently merged or closed PR completes the stale gate, while an open, unknown, or unreachable PR remains parked
 - Marks every other stale active run as `failed` with the message "daemon crashed during execution"
 - Reaps orphaned managed agent servers left behind by a crashed daemon or setup wizard

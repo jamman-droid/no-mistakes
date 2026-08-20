@@ -91,6 +91,11 @@ func (a *identityAgent) resultWithIdentity(result *Result) *Result {
 	if result == nil {
 		return nil
 	}
+	if !result.identityApplied {
+		result.ObservedModel = result.Model
+		result.ObservedModelProvider = result.ModelProvider
+		result.identityApplied = true
+	}
 	result.Provider = a.identity.Name
 	if result.ModelProvider == "" {
 		result.ModelProvider = a.identity.ModelProvider

@@ -206,9 +206,16 @@ type Result struct {
 	// ModelProvider is the provider that served the model (e.g. "openai",
 	// "anthropic"), when the adapter can report it. Instrumentation only.
 	ModelProvider string
+	// ObservedModel and ObservedModelProvider retain only adapter-reported
+	// runtime identity. Identity decorators may fill Model/ModelProvider from
+	// declared configuration for backward-compatible telemetry, but must not
+	// turn those declarations into observed evidence.
+	ObservedModel         string
+	ObservedModelProvider string
 	// Provider is the adapter provider that served this invocation. It lets
 	// fallback wrappers persist a session against the provider that minted it.
-	Provider string
+	Provider        string
+	identityApplied bool
 	// Metrics is the bounded per-invocation activity evidence the adapter
 	// extracted from its event stream (round-trips, tool calls + categories,
 	// subprocess wait time). Nil means the adapter reported nothing, which is
@@ -223,6 +230,44 @@ type Result struct {
 	// durable session, so round N's counters include rounds 1..N-1. The pipeline
 	// uses it to record correct per-round token deltas (see PerRoundTokens).
 	SessionUsageCumulative bool
+}
+
+// ObservedModelIdentity returns only identity reported by the concrete adapter,
+// excluding values filled from declared candidate configuration.
+func (r *Result) ObservedModelIdentity() (provider, model string) {
+	if r == nil {
+		return "", ""
+	}
+	if r.identityApplied {
+		return r.ObservedModelProvider, r.ObservedModel
+	}
+	return r.ModelProvider, r.Model
+}
+
+// SafeObservedIdentity bounds adapter-reported provider/model identity to a
+// small token vocabulary suitable for durable/public evidence. Invalid values
+// are omitted rather than allowing paths, URLs, credentials, or arbitrary
+// adapter output across the attestation boundary.
+func SafeObservedIdentity(value string) (string, bool) {
+	if value == "" || len(value) > 128 || strings.TrimSpace(value) != value ||
+		strings.Contains(value, "://") || strings.HasPrefix(value, "/") ||
+		strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") ||
+		strings.Contains(value, "\\") || strings.Contains(value, "@") {
+		return "", false
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return "", false
+		}
+	}
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			r == '.' || r == '_' || r == '-' || r == '+' || r == '/' {
+			continue
+		}
+		return "", false
+	}
+	return value, true
 }
 
 // TokenUsage tracks token consumption for an agent invocation.

@@ -196,9 +196,11 @@ It never sends a SHA, run ID, path, branch name, URL, remote name, or command ar
 Everything sent remotely is low-cardinality: command names, statuses, durations, counts, flag booleans, agent and step names, and - on the single terminal `run finished` event - the bounded performance rollup `agent_invocations`, `resumed_invocations`, and `fallback_invocations` (small counts only).
 Run IDs, repository paths, branch names, session identities, prompts, model outputs, diffs, and per-invocation performance records are never sent.
 
-Detailed performance evidence stays on the machine in the local state database (`<NM_HOME>/state.sqlite`): one `agent_invocations` row per agent invocation, plus each run's accumulated parked-at-gate time.
-Each row records run and step identity, purpose (such as review/review-fix/housekeeping), the reported model and its provider, the cold/started/resumed/fallback session mode, a truncated session-identity hash, timestamps, duration, exit status, and failure category, alongside the session-fidelity metrics below.
-It never stores prompts, model outputs, diffs, raw command arguments, secret values, or credentials - only bounded counts, low-cardinality categories, and durations.
+Detailed performance evidence stays on the machine in the local state database (`<NM_HOME>/state.sqlite`): one `agent_invocations` row per agent invocation, each run's accumulated parked-at-gate time, and each run's role-resolution snapshot.
+Each row records run and step identity, purpose (such as review/review-fix/housekeeping), the pipeline role (`reviewer` or `implementer`) and the index of the configured candidate that served the attempt, that candidate's declared harness, provider, and model, the serving model and its provider (adapter-reported when available, otherwise the candidate's declaration), the separately recorded adapter-observed provider and model (left unset when the adapter reported none, so a declaration is never mistaken for runtime evidence), the cold/started/resumed/fallback session mode, a truncated session-identity hash, timestamps, duration, exit status, and failure category, alongside the session-fidelity metrics below.
+Each run also stores the redacted role resolution taken at startup, covering every configured candidate for both roles including the ones that were unavailable or duplicate, so its attempts can be attributed to the policy that was actually in force.
+Because a pipeline-role attempt is part of that evidence, a failed local insert fails the invocation rather than letting the run report evidence that was never written.
+It never stores prompts, model outputs, diffs, raw command arguments, secret values, or credentials - identity is bounded to a small token vocabulary and candidate arguments appear only as a hash, alongside bounded counts, low-cardinality categories, and durations.
 
 The additive session-fidelity fields are nullable and read back as unknown (rendered `-`) rather than a fabricated zero when the adapter did not report them, so rows written before a field existed, and adapters that do not surface a datum, stay honest.
 The legacy raw input, output, and cache-read token counters render numerically; use the nullable per-round and derived fields to determine whether the adapter reported comparable usage:
@@ -210,6 +212,7 @@ The legacy raw input, output, and cache-read token counters render numerically; 
 
 The count and timing definitions live in one authoritative place (`internal/agent/invocationmetrics.go`).
 Inspect the evidence with `no-mistakes stats --agents` (per-purpose aggregates, including a `METRICS` coverage count so a real zero is distinguishable from missing instrumentation) or `no-mistakes stats --run <id>` (one run's invocations, the per-round-vs-cumulative token split, and parked time).
+For the role and candidate half - the startup snapshot next to each concrete attempt, as machine-readable JSON - use [`no-mistakes axi attest`](/no-mistakes/reference/cli/#no-mistakes-axi-attest).
 
 ## `NO_MISTAKES_TELEMETRY`
 

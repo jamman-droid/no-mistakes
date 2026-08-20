@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	"os/exec"
 	"reflect"
 	"strings"
@@ -84,6 +85,8 @@ func TestLoadAgentRoles_RejectsInvalidStructuredCandidates(t *testing.T) {
 		{name: "managed arg", yaml: "agent_roles:\n  reviewer: {harness: pi, args: [--mode, json]}\n", want: "managed by no-mistakes"},
 		{name: "acp args silently ignored", yaml: "agent_roles:\n  reviewer: {harness: 'acp:gemini', args: [--model, gemini]}\n", want: "not supported"},
 		{name: "unsafe identity", yaml: "agent_roles:\n  reviewer: {harness: pi, provider: 'openai\\nsecret'}\n", want: "provider"},
+		{name: "credential URL provider", yaml: "agent_roles:\n  reviewer: {harness: pi, provider: 'https://user:secret@example.com'}\n", want: "provider"},
+		{name: "path-like model", yaml: "agent_roles:\n  reviewer: {harness: pi, model: 'models/../../Users/alice/key'}\n", want: "model"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -92,6 +95,67 @@ func TestLoadAgentRoles_RejectsInvalidStructuredCandidates(t *testing.T) {
 				t.Fatalf("error = %v, want mention %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestLoadAgentRoles_AcceptsLegacyVersionSeparatorIdentities(t *testing.T) {
+	cfg, err := LoadGlobalFromBytes([]byte(`agent_roles:
+  reviewer:
+    - harness: pi
+      provider: ollama
+      model: 'llama3:8b'
+    - harness: pi
+      provider: vertex
+      model: 'claude-3-7@20250219'
+`))
+	if err != nil {
+		t.Fatalf("LoadGlobalFromBytes: %v", err)
+	}
+	if len(cfg.AgentRoles.Reviewer) != 2 {
+		t.Fatalf("reviewer candidates = %+v, want 2", cfg.AgentRoles.Reviewer)
+	}
+	if got := cfg.AgentRoles.Reviewer[0]; got.Provider != "ollama" || got.Model != "llama3:8b" {
+		t.Fatalf("first reviewer candidate = %+v", got)
+	}
+	if got := cfg.AgentRoles.Reviewer[1]; got.Provider != "vertex" || got.Model != "claude-3-7@20250219" {
+		t.Fatalf("second reviewer candidate = %+v", got)
+	}
+}
+
+func TestAgentCandidateLabelIsAStableDurableSessionOwnershipKey(t *testing.T) {
+	got := AgentCandidate{Harness: types.AgentPi, Provider: "ollama", Model: "llama3:8b"}.Label()
+	if want := `candidate[harness="pi";provider="ollama";model="llama3:8b"]`; got != want {
+		t.Fatalf("session ownership key = %q, want %q", got, want)
+	}
+	if other := (AgentCandidate{Harness: types.AgentPi, Provider: "ollama", Model: "llama3:70b"}).Label(); other == got {
+		t.Fatalf("distinct candidates collapsed to one key: %q", got)
+	}
+	if bare := (AgentCandidate{Harness: types.AgentPi}).Label(); bare != "pi" {
+		t.Fatalf("legacy bare candidate key = %q", bare)
+	}
+}
+
+func TestEffectiveAgentRolePolicyRedactsUnsafeConfiguredIdentity(t *testing.T) {
+	cfg := &Config{AgentRoles: AgentRoles{Reviewer: RoleSelection{
+		{Harness: types.AgentPi, Provider: "ollama", Model: "llama3:8b"},
+		{Harness: types.AgentPi, Provider: "ollama", Model: "llama3:70b"},
+	}}}
+	candidates := cfg.EffectiveAgentRolePolicy().Reviewer.Candidates
+	if len(candidates) != 2 {
+		t.Fatalf("reviewer candidates = %+v, want 2", candidates)
+	}
+	if candidates[0].Model == "" || candidates[0].Model == candidates[1].Model {
+		t.Fatalf("redacted models = %q/%q", candidates[0].Model, candidates[1].Model)
+	}
+	encoded, err := json.Marshal(candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "llama3:8b") || strings.Contains(string(encoded), "llama3:70b") {
+		t.Fatalf("policy evidence exposed unsafe identity: %s", encoded)
+	}
+	if candidates[0].RuntimeLabel == candidates[1].RuntimeLabel {
+		t.Fatalf("runtime labels collapsed: %q", candidates[0].RuntimeLabel)
 	}
 }
 
@@ -127,8 +191,12 @@ func TestMerge_StructuredRoleCandidatePrecedencePreservesCompleteSeat(t *testing
 		}}},
 	}
 	repoDefault := &RepoConfig{Agent: types.AgentCodex, Agents: []types.AgentName{types.AgentCodex}}
-	if got := Merge(global, repoDefault).AgentRoles.Reviewer; len(got) != 1 || got[0].Harness != types.AgentCodex {
+	mergedDefault := Merge(global, repoDefault)
+	if got := mergedDefault.AgentRoles.Reviewer; len(got) != 1 || got[0].Harness != types.AgentCodex {
 		t.Fatalf("repository legacy agent did not override global role: %+v", got)
+	}
+	if mergedDefault.AgentRoleSources.Reviewer != AgentRoleSourceRepositoryDefault {
+		t.Fatalf("repository default source = %q", mergedDefault.AgentRoleSources.Reviewer)
 	}
 	repoRole := &RepoConfig{
 		Agent:  types.AgentCodex,
@@ -137,9 +205,17 @@ func TestMerge_StructuredRoleCandidatePrecedencePreservesCompleteSeat(t *testing
 			Harness: types.AgentPi, Provider: "repo", Model: "repo-model", Args: []string{"--model", "repo-model"},
 		}}},
 	}
-	got := Merge(global, repoRole).AgentRoles.Reviewer
+	mergedRole := Merge(global, repoRole)
+	got := mergedRole.AgentRoles.Reviewer
 	if len(got) != 1 || got[0].Provider != "repo" || got[0].Model != "repo-model" || !reflect.DeepEqual(got[0].Args, []string{"--model", "repo-model"}) {
 		t.Fatalf("repository role did not preserve complete candidate: %+v", got)
+	}
+	policy := mergedRole.EffectiveAgentRolePolicy()
+	if policy.Reviewer.Source != AgentRoleSourceRepositoryRole || len(policy.Reviewer.Candidates) != 1 || policy.Reviewer.Candidates[0].Status != "configured" {
+		t.Fatalf("effective reviewer policy = %+v", policy.Reviewer)
+	}
+	if strings.Contains(policy.Reviewer.Candidates[0].Label, "repo-model") && strings.Contains(policy.Reviewer.Candidates[0].Label, "--model") {
+		t.Fatalf("effective policy label exposed raw args: %q", policy.Reviewer.Candidates[0].Label)
 	}
 }
 
@@ -204,5 +280,147 @@ func TestAgentArgsForCandidate_AppendsCandidateArgsWithoutMutatingConfig(t *test
 	got[0] = "changed"
 	if cfg.AgentArgsOverride["pi"][0] != "--thinking" || candidate.Args[0] != "--provider" {
 		t.Fatal("AgentArgsForCandidate aliased its config inputs")
+	}
+}
+
+func TestEffectiveAgentRolePolicyFingerprintsCompleteLaunchArguments(t *testing.T) {
+	candidate := AgentCandidate{Harness: types.AgentCodex, Args: []string{"--sandbox", "workspace-write"}}
+	first := &Config{AgentRoles: AgentRoles{Reviewer: RoleSelection{candidate}}, AgentArgsOverride: map[string][]string{"codex": {"--model", "first"}}}
+	second := &Config{AgentRoles: AgentRoles{Reviewer: RoleSelection{candidate}}, AgentArgsOverride: map[string][]string{"codex": {"--model", "second"}}}
+	firstHash := first.EffectiveAgentRolePolicy().Reviewer.Candidates[0].ArgsSHA256
+	secondHash := second.EffectiveAgentRolePolicy().Reviewer.Candidates[0].ArgsSHA256
+	if firstHash == "" || secondHash == "" || firstHash == secondHash {
+		t.Fatalf("effective launch hashes = %q/%q", firstHash, secondHash)
+	}
+}
+
+func TestResolveAgentWithReportProbesEachHarnessOncePerResolution(t *testing.T) {
+	probes := map[string]int{}
+	cfg := &Config{Agent: types.AgentClaude, Agents: []types.AgentName{types.AgentClaude}}
+	report, err := cfg.ResolveAgentWithReport(context.Background(), func(bin string) (string, error) {
+		probes[bin]++
+		return "/usr/bin/" + bin, nil
+	})
+	if err != nil {
+		t.Fatalf("ResolveAgentWithReport: %v", err)
+	}
+	if probes["claude"] != 1 {
+		t.Fatalf("claude probed %d times across the default and both role seats, want 1", probes["claude"])
+	}
+	for _, role := range []RoleResolution{report.Reviewer, report.Implementer} {
+		if len(role.Candidates) != 1 || role.Candidates[0].Harness != types.AgentClaude || role.Candidates[0].Status != AgentCandidateAvailable {
+			t.Fatalf("inherited role evidence = %+v", role.Candidates)
+		}
+	}
+	if len(cfg.AgentRoles.Reviewer) != 1 || cfg.AgentRoles.Reviewer[0].Harness != types.AgentClaude {
+		t.Fatalf("resolved reviewer selection = %+v", cfg.AgentRoles.Reviewer)
+	}
+}
+
+func TestResolveAgentWithReportRetainsUnavailableAndDuplicateCandidates(t *testing.T) {
+	secret := "candidate-secret-must-not-leak"
+	cfg := &Config{
+		Agent:  types.AgentClaude,
+		Agents: []types.AgentName{types.AgentClaude},
+		AgentRoles: AgentRoles{
+			Reviewer: RoleSelection{
+				{Harness: types.AgentPi, Provider: "openai", Model: "gpt-5.4", Args: []string{"--token", secret}},
+				{Harness: types.AgentCodex, Provider: "openai", Model: "gpt-5.4"},
+				{Harness: types.AgentCodex, Provider: "openai", Model: "gpt-5.4"},
+			},
+			Implementer: RoleSelection{{Harness: types.AgentClaude, Provider: "anthropic", Model: "claude-opus-5"}},
+		},
+	}
+	lookPath := func(path string) (string, error) {
+		if path == "pi" {
+			return "", exec.ErrNotFound
+		}
+		return "/bin/" + path, nil
+	}
+
+	report, err := cfg.ResolveAgentWithReport(context.Background(), lookPath)
+	if err != nil {
+		t.Fatalf("ResolveAgentWithReport: %v", err)
+	}
+	if got := cfg.AgentRoles.Reviewer; len(got) != 1 || got[0].Harness != types.AgentCodex {
+		t.Fatalf("runnable reviewer selection = %+v, want one codex candidate", got)
+	}
+	got := report.Reviewer.Candidates
+	if len(got) != 3 {
+		t.Fatalf("reviewer report = %+v, want all 3 configured candidates", got)
+	}
+	if got[0].Index != 0 || got[0].Status != AgentCandidateUnavailable || got[0].Reason != AgentCandidateReasonExecutableNotFound {
+		t.Fatalf("unavailable candidate = %+v", got[0])
+	}
+	if got[1].Index != 1 || got[1].Status != AgentCandidateAvailable {
+		t.Fatalf("available candidate = %+v", got[1])
+	}
+	if got[2].Index != 2 || got[2].Status != AgentCandidateSkipped || got[2].Reason != AgentCandidateReasonDuplicate {
+		t.Fatalf("duplicate candidate = %+v", got[2])
+	}
+	if strings.Contains(report.Reviewer.Candidates[0].Label, secret) {
+		t.Fatalf("public resolution label exposes arguments: %q", report.Reviewer.Candidates[0].Label)
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), "--token") {
+		t.Fatalf("resolution snapshot exposes raw arguments: %s", encoded)
+	}
+	if report.Reviewer.Candidates[0].ArgsSHA256 == "" {
+		t.Fatal("resolution snapshot lost redacted argument identity")
+	}
+}
+
+// A host where no configured harness is installed never constructs an adapter,
+// so the resolution report is the only evidence the run can ever persist. It
+// must still name every configured candidate and stay redacted.
+func TestResolveAgentWithReportKeepsCompleteEvidenceWhenNothingIsRunnable(t *testing.T) {
+	secret := "candidate-secret-must-not-leak"
+	cfg := &Config{
+		Agent:  types.AgentClaude,
+		Agents: []types.AgentName{types.AgentClaude},
+		AgentRoles: AgentRoles{
+			Reviewer: RoleSelection{
+				{Harness: types.AgentPi, Provider: "openai", Model: "gpt-5.4", Args: []string{"--token", secret}},
+				{Harness: types.AgentOpenCode, Model: "fallback"},
+			},
+			Implementer: RoleSelection{{Harness: types.AgentClaude, Provider: "anthropic", Model: "claude-opus-5"}},
+		},
+	}
+
+	report, err := cfg.ResolveAgentWithReport(context.Background(), func(string) (string, error) {
+		return "", exec.ErrNotFound
+	})
+	if err == nil {
+		t.Fatal("resolution succeeded with no installed harness")
+	}
+	if cfg.AgentRoleResolution == nil {
+		t.Fatal("failed resolution left no snapshot on the config for the run to persist")
+	}
+	for name, role := range map[string]RoleResolution{"reviewer": report.Reviewer, "implementer": report.Implementer} {
+		want := len(cfg.AgentRoles.Reviewer)
+		if name == "implementer" {
+			want = len(cfg.AgentRoles.Implementer)
+		}
+		if len(role.Candidates) != want {
+			t.Fatalf("%s evidence = %+v, want all %d configured candidates", name, role.Candidates, want)
+		}
+		for _, candidate := range role.Candidates {
+			if candidate.Status != AgentCandidateUnavailable || candidate.Reason != AgentCandidateReasonExecutableNotFound {
+				t.Fatalf("%s candidate %d = %+v, want an unavailable host observation", name, candidate.Index, candidate)
+			}
+		}
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), "--token") {
+		t.Fatalf("failed-resolution snapshot exposes raw arguments: %s", encoded)
+	}
+	if report.Reviewer.Candidates[0].ArgsSHA256 == "" {
+		t.Fatal("failed-resolution snapshot lost redacted argument identity")
 	}
 }

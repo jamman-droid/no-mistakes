@@ -64,7 +64,7 @@ func gateOptOutWorktree(t *testing.T, repoYAML string) (string, string) {
 // .no-mistakes.yaml, which is NOT opted out and must NOT abort.
 func TestAssertGateTrustedConfigReadable_FileAbsentIsOK(t *testing.T) {
 	wt, sha := gateOptOutWorktree(t, "")
-	if err := assertGateTrustedConfigReadable(context.Background(), wt, "main", sha); err != nil {
+	if err := assertGateTrustedConfigReadable(context.Background(), wt, trustedConfigSubjectOptOut, "main", sha); err != nil {
 		t.Errorf("file legitimately absent must NOT abort, got: %v", err)
 	}
 }
@@ -73,7 +73,7 @@ func TestAssertGateTrustedConfigReadable_FileAbsentIsOK(t *testing.T) {
 // parseable trusted config (opted out or not) does not abort.
 func TestAssertGateTrustedConfigReadable_PresentAndParseableIsOK(t *testing.T) {
 	wt, sha := gateOptOutWorktree(t, "disable_project_settings: true\n")
-	if err := assertGateTrustedConfigReadable(context.Background(), wt, "main", sha); err != nil {
+	if err := assertGateTrustedConfigReadable(context.Background(), wt, trustedConfigSubjectOptOut, "main", sha); err != nil {
 		t.Errorf("present parseable trusted config must NOT abort, got: %v", err)
 	}
 	// And the value is honored trusted-only.
@@ -88,7 +88,7 @@ func TestAssertGateTrustedConfigReadable_PresentAndParseableIsOK(t *testing.T) {
 // LOUD, never silently become false.
 func TestAssertGateTrustedConfigReadable_FetchFailureAborts(t *testing.T) {
 	wt, _ := gateOptOutWorktree(t, "disable_project_settings: true\n")
-	err := assertGateTrustedConfigReadable(context.Background(), wt, "main", "")
+	err := assertGateTrustedConfigReadable(context.Background(), wt, trustedConfigSubjectOptOut, "main", "")
 	if err == nil {
 		t.Fatal("empty trustedSHA (fetch failure) must abort")
 	}
@@ -101,7 +101,7 @@ func TestAssertGateTrustedConfigReadable_FetchFailureAborts(t *testing.T) {
 // default branch (no trusted copy to read) aborts.
 func TestAssertGateTrustedConfigReadable_NoDefaultBranchAborts(t *testing.T) {
 	wt, sha := gateOptOutWorktree(t, "")
-	if err := assertGateTrustedConfigReadable(context.Background(), wt, "", sha); err == nil {
+	if err := assertGateTrustedConfigReadable(context.Background(), wt, trustedConfigSubjectOptOut, "", sha); err == nil {
 		t.Fatal("empty default branch must abort")
 	}
 }
@@ -112,7 +112,7 @@ func TestAssertGateTrustedConfigReadable_NoDefaultBranchAborts(t *testing.T) {
 func TestAssertGateTrustedConfigReadable_UnreadableCommitAborts(t *testing.T) {
 	wt, _ := gateOptOutWorktree(t, "")
 	bogus := "0123456789abcdef0123456789abcdef01234567"
-	if err := assertGateTrustedConfigReadable(context.Background(), wt, "main", bogus); err == nil {
+	if err := assertGateTrustedConfigReadable(context.Background(), wt, trustedConfigSubjectOptOut, "main", bogus); err == nil {
 		t.Fatal("an unreadable trusted commit must abort")
 	}
 }
@@ -149,7 +149,7 @@ func TestAssertGateTrustedConfigReadable_PresentUnreadableBlobAborts(t *testing.
 		t.Fatalf("remove trusted config blob: %v", err)
 	}
 
-	err = assertGateTrustedConfigReadable(context.Background(), wt, "main", commitSHA)
+	err = assertGateTrustedConfigReadable(context.Background(), wt, trustedConfigSubjectOptOut, "main", commitSHA)
 	if err == nil {
 		t.Fatal("a present but unreadable trusted config blob must abort")
 	}
@@ -162,7 +162,7 @@ func TestAssertGateTrustedConfigReadable_PresentUnreadableBlobAborts(t *testing.
 // malformed trusted .no-mistakes.yaml aborts (we cannot evaluate the boundary).
 func TestAssertGateTrustedConfigReadable_UnparseableAborts(t *testing.T) {
 	wt, sha := gateOptOutWorktree(t, "disable_project_settings: : : {{not yaml\n")
-	err := assertGateTrustedConfigReadable(context.Background(), wt, "main", sha)
+	err := assertGateTrustedConfigReadable(context.Background(), wt, trustedConfigSubjectOptOut, "main", sha)
 	if err == nil {
 		t.Fatal("unparseable trusted config must abort")
 	}

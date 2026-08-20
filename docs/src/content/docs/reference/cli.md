@@ -21,6 +21,22 @@ Unlike `no-mistakes attach`, bare `no-mistakes` only auto-attaches to an active 
 `--skip` only applies when bare `no-mistakes` starts a new pipeline run through the wizard; it does not skip a step on an already-active run.
 Valid step names are `intent`, `rebase`, `review`, `test`, `document`, `lint`, `push`, `pr`, and `ci`.
 
+## no-mistakes capabilities
+
+Prints state-free, versioned JSON describing the immutable capabilities of the current binary. It does not open app state, inspect configuration, contact the daemon, or probe agent executables. `--json` is required; there is no human-readable form.
+
+```sh
+no-mistakes capabilities --json
+```
+
+## no-mistakes roles resolve
+
+Prints versioned JSON for the effective reviewer and implementer policy after trusted repository/global precedence. Candidate order and redacted identity are preserved; raw candidate arguments are never returned. The command freshly pins the registered repository's trusted default branch, but does not probe or launch any agent. `--json` is required, `--repo` defaults to the current directory, and the repository must already be registered by `no-mistakes init`. When the trusted default branch cannot be fetched, resolved, or read, the command fails naming that boundary instead of answering from a stale ref. The branch half of the answer comes from the checkout's committed `HEAD`, reported as `target_sha`, so an uncommitted `.no-mistakes.yaml` edit is not reflected.
+
+```sh
+no-mistakes roles resolve --repo . --json
+```
+
 ## no-mistakes init
 
 Initialize or refresh the gate for the current repository.
@@ -78,6 +94,14 @@ AXI help and outputs always repeat the preserve-prior-gate-progress contract: af
 When a relevant `branch_sync` object is present, they also include version-matched synchronization guidance to follow before a post-pipeline local commit or fresh run.
 Agents must not abort-and-restart, reset, replace the branch, or improvise Git recovery in a way that drops prior gate-fix commits.
 A fresh run re-validates the current branch state, so already-resolved findings do not re-surface.
+
+## no-mistakes axi attest
+
+Prints versioned local JSON for one run's redacted startup role resolution and concrete invocation attempts. It distinguishes declared candidate identity from bounded adapter-observed model identity, records unavailable and duplicate candidates as skipped, and reports bounded outcome/reason categories. Invalid observed identity is omitted. Runs created before this evidence existed report `capture_status: unavailable_legacy` instead of claiming a current snapshot. It never emits prompts, outputs, diffs, raw arguments, error text, credentials, paths, URLs, or native session IDs, and works while the daemon is stopped. Both `--run` and `--json` are required.
+
+```sh
+no-mistakes axi attest --run <run-id> --json
+```
 
 ## no-mistakes axi run
 

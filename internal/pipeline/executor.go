@@ -694,6 +694,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		if selected == nil {
 			return nil
 		}
+		candidateEvidence := e.agentCandidateResolutions(role)
 		selected = &gateStepBoundaryAgent{inner: selected, phase: stepName}
 		selected = &lifecycleAgent{inner: selected, onLifecycle: onAgentLifecycle}
 		selected = &observableRoleAgent{
@@ -705,11 +706,13 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			stepName:   stepName,
 		}
 		return &perfRecordingAgent{
-			inner:    selected,
-			db:       e.db,
-			runID:    run.ID,
-			stepName: stepName,
-			round:    func() int { return invocationRound },
+			inner:      selected,
+			db:         e.db,
+			runID:      run.ID,
+			stepName:   stepName,
+			role:       role,
+			candidates: candidateEvidence,
+			round:      func() int { return invocationRound },
 		}
 	}
 	stepAgent := decorateAgent("implementer", e.agents.Implementer)
@@ -1086,6 +1089,35 @@ func roundInsertID(_ string, inserted *db.StepRound, err error) string {
 		return ""
 	}
 	return inserted.ID
+}
+
+func (e *Executor) agentCandidateResolutions(role string) []config.AgentCandidateResolution {
+	if e.config == nil {
+		return nil
+	}
+	if resolution := e.config.AgentRoleResolution; resolution != nil {
+		if role == "reviewer" {
+			return append([]config.AgentCandidateResolution(nil), resolution.Reviewer.Candidates...)
+		}
+		if role == "implementer" {
+			return append([]config.AgentCandidateResolution(nil), resolution.Implementer.Candidates...)
+		}
+	}
+	var selection config.RoleSelection
+	if role == "reviewer" {
+		selection = e.config.AgentRoles.Reviewer
+	} else if role == "implementer" {
+		selection = e.config.AgentRoles.Implementer
+	}
+	out := make([]config.AgentCandidateResolution, 0, len(selection))
+	for index, candidate := range selection {
+		out = append(out, config.AgentCandidateResolution{
+			Index: index, Harness: candidate.Harness, Provider: candidate.Provider,
+			Model: candidate.Model, Label: fmt.Sprintf("candidate-%d", index),
+			RuntimeLabel: candidate.Label(), Status: config.AgentCandidateAvailable,
+		})
+	}
+	return out
 }
 
 func (e *Executor) agentCandidates(role, fallback string) []string {

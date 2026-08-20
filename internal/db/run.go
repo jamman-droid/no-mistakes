@@ -57,16 +57,18 @@ type Run struct {
 	// ParkedMS accumulates the run's total parked-at-gate wall time in
 	// milliseconds across every gate wait (local performance telemetry;
 	// step duration_ms values exclude this time).
-	ParkedMS        int64
-	Intent          *string
-	IntentSource    *string
-	IntentSessionID *string
-	IntentScore     *float64
-	CreatedAt       int64
-	UpdatedAt       int64
+	ParkedMS              int64
+	AgentRoleSnapshot     *string
+	AgentRoleSnapshotHash *string
+	Intent                *string
+	IntentSource          *string
+	IntentSessionID       *string
+	IntentScore           *float64
+	CreatedAt             int64
+	UpdatedAt             int64
 }
 
-const runColumns = `id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, created_at, updated_at`
+const runColumns = `id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), agent_role_snapshot, agent_role_snapshot_hash, intent, intent_source, intent_session_id, intent_score, created_at, updated_at`
 
 func scanRun(row interface {
 	Scan(...any) error
@@ -77,6 +79,7 @@ func scanRun(row interface {
 		&r.LastPushedSHA, &r.PushTargetKind, &r.PushTargetFingerprint, &r.PushRef,
 		&r.LastPushedAt, &r.PushGeneration, &r.PushActive, &r.TerminalHeadVerifiedAt,
 		&r.CustodyReturnedAt, &r.Error, &r.AwaitingAgentSince, &r.ParkedMS,
+		&r.AgentRoleSnapshot, &r.AgentRoleSnapshotHash,
 		&r.Intent, &r.IntentSource, &r.IntentSessionID, &r.IntentScore,
 		&r.CreatedAt, &r.UpdatedAt,
 	)
@@ -129,6 +132,29 @@ func (d *DB) GetRun(id string) (*Run, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get run: %w", err)
+	}
+	return r, nil
+}
+
+// GetRunForAgentEvidence reads both current and pre-Slice-1 schemas. The
+// compatibility path is read-only and represents absent snapshot columns as
+// NULL so a newly installed CLI can attest a legacy run while the daemon is
+// stopped and before any migration has run.
+func (d *DB) GetRunForAgentEvidence(id string) (*Run, error) {
+	r := &Run{}
+	err := scanRun(d.sql.QueryRow(`SELECT `+runColumns+` FROM runs WHERE id = ?`, id), r)
+	if err != nil && strings.Contains(err.Error(), "no such column: agent_role_snapshot") {
+		legacyColumns := strings.Replace(runColumns,
+			"agent_role_snapshot, agent_role_snapshot_hash",
+			"NULL AS agent_role_snapshot, NULL AS agent_role_snapshot_hash", 1)
+		r = &Run{}
+		err = scanRun(d.sql.QueryRow(`SELECT `+legacyColumns+` FROM runs WHERE id = ?`, id), r)
+	}
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get run for agent evidence: %w", err)
 	}
 	return r, nil
 }
@@ -228,6 +254,26 @@ func (d *DB) UpdateRunStatus(id string, status types.RunStatus) error {
 	_, err := d.sql.Exec(`UPDATE runs SET status = ?, push_active = CASE WHEN ? IN ('completed', 'failed', 'cancelled') THEN 0 ELSE push_active END, terminal_head_verified_at = NULL, updated_at = ? WHERE id = ?`, status, status, now(), id)
 	if err != nil {
 		return fmt.Errorf("update run status: %w", err)
+	}
+	return nil
+}
+
+// SetRunAgentRoleSnapshot stores the redacted startup role resolution before
+// any agent invocation. It is immutable once written so recovery cannot replace
+// the evidence with a later machine/configuration observation.
+func (d *DB) SetRunAgentRoleSnapshot(id, snapshot, hash string) error {
+	result, err := d.sql.Exec(`UPDATE runs SET agent_role_snapshot = ?, agent_role_snapshot_hash = ?, updated_at = ? WHERE id = ? AND agent_role_snapshot IS NULL`, snapshot, hash, now(), id)
+	if err != nil {
+		return fmt.Errorf("set run agent role snapshot: %w", err)
+	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr == nil && rows == 0 {
+		var existingSnapshot, existingHash sql.NullString
+		if queryErr := d.sql.QueryRow(`SELECT agent_role_snapshot, agent_role_snapshot_hash FROM runs WHERE id = ?`, id).Scan(&existingSnapshot, &existingHash); queryErr != nil {
+			return fmt.Errorf("read existing run agent role snapshot: %w", queryErr)
+		}
+		if !existingSnapshot.Valid || existingSnapshot.String != snapshot || !existingHash.Valid || existingHash.String != hash {
+			return fmt.Errorf("run agent role snapshot already recorded with different evidence")
+		}
 	}
 	return nil
 }

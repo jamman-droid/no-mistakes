@@ -60,6 +60,37 @@ func TestRunInsertAndUpdatePreserveBuildIdentity(t *testing.T) {
 	}
 }
 
+func TestRunAgentRoleSnapshotRoundTrip(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
+	run, err := d.InsertRun(repo.ID, "feature", "abc123", "def456")
+	if err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+
+	const snapshot = `{"schema":"no-mistakes-agent-role-resolution/v1","roles":{"reviewer":{"candidates":[]},"implementer":{"candidates":[]}}}`
+	const hash = "aabbccdd"
+	if err := d.SetRunAgentRoleSnapshot(run.ID, snapshot, hash); err != nil {
+		t.Fatalf("set role snapshot: %v", err)
+	}
+	got, err := d.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got.AgentRoleSnapshot == nil || *got.AgentRoleSnapshot != snapshot || got.AgentRoleSnapshotHash == nil || *got.AgentRoleSnapshotHash != hash {
+		t.Fatalf("role snapshot/hash = %v/%v", got.AgentRoleSnapshot, got.AgentRoleSnapshotHash)
+	}
+	if err := d.SetRunAgentRoleSnapshot(run.ID, snapshot, hash); err != nil {
+		t.Fatalf("idempotent same snapshot: %v", err)
+	}
+	if err := d.SetRunAgentRoleSnapshot(run.ID, `{"different":true}`, "different"); err == nil {
+		t.Fatal("conflicting immutable snapshot was accepted")
+	}
+	if err := d.SetRunAgentRoleSnapshot("missing-run", snapshot, hash); err == nil {
+		t.Fatal("unknown run snapshot write was accepted")
+	}
+}
+
 func TestInsertRunWithIntent(t *testing.T) {
 	d := openTestDB(t)
 	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
