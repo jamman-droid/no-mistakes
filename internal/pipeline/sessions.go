@@ -94,6 +94,9 @@ func (rs *RunSessions) Run(ctx context.Context, a agent.Agent, role SessionRole,
 	}
 	var evidenceErr *attemptEvidencePersistenceError
 	if storedID == "" || ctx.Err() != nil || errors.As(err, &evidenceErr) {
+		// errors.As only matches when attempt-evidence persistence was the sole
+		// failure: the turn itself succeeded, so re-running it would duplicate
+		// work rather than recover anything.
 		return result, err
 	}
 

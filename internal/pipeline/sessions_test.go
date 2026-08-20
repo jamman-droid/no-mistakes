@@ -145,6 +145,35 @@ func TestRunSessions_AttemptEvidenceFailureDoesNotRepeatSuccessfulResume(t *test
 	}
 }
 
+func TestRunSessions_FailedResumeStillRetriesColdWhenEvidenceAlsoFails(t *testing.T) {
+	d, run := sessionTestDB(t)
+	fake := newFakeSessionAgent()
+	wrapped := &perfRecordingAgent{
+		inner: fake, db: d, runID: run.ID, stepName: "review", role: "reviewer",
+		round: func() int { return 1 },
+	}
+	rs := NewRunSessions(d, run.ID, wrapped, true)
+	if _, err := rs.Run(context.Background(), wrapped, SessionRoleFixer, agent.RunOpts{Prompt: "first"}, nil); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	fake.failResumes["sess-1"] = errors.New("resume rejected by adapter")
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rs.Run(context.Background(), wrapped, SessionRoleFixer, agent.RunOpts{Prompt: "retry"}, nil); err == nil {
+		t.Fatal("evidence persistence failure must still fail the invocation")
+	}
+	if len(fake.calls) != 3 {
+		t.Fatalf("failed resume skipped its fresh-session retry: calls = %d, want 3", len(fake.calls))
+	}
+	if last := fake.calls[2]; !last.fallback || last.session == nil || last.session.ID != "" {
+		t.Fatalf("retry did not run in a fresh session: %+v", last)
+	}
+	if got := rs.id(SessionRoleFixer); got.ID != "" {
+		t.Fatalf("dead session identity survived: %+v", got)
+	}
+}
+
 // TestRunSessions_RolesKeepDistinctSessions proves two roles interleaved on
 // one RunSessions never exchange identities, in both directions. Legacy
 // "reviewer" rows can still coexist with fixer rows on recovered runs, so

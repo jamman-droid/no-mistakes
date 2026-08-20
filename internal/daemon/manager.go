@@ -38,6 +38,11 @@ var recoveredConfigFetchTimeout = 10 * time.Second
 
 var fetchRecoveredRemoteBranch = git.FetchRemoteBranch
 
+const (
+	trustedConfigSubjectOptOut = "disable_project_settings"
+	trustedConfigSubjectRoles  = "effective agent roles"
+)
+
 // RunManager tracks active pipeline executors and manages run lifecycle.
 type RunManager struct {
 	mu           sync.Mutex
@@ -253,7 +258,7 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 	}
 	// SECURITY: a trusted-config fetch failure must abort, not silently disable
 	// the disable_project_settings opt-out (see assertGateTrustedConfigReadable).
-	if err := assertGateTrustedConfigReadable(ctx, workDir, repo.DefaultBranch, trustedSHA); err != nil {
+	if err := assertGateTrustedConfigReadable(ctx, workDir, trustedConfigSubjectOptOut, repo.DefaultBranch, trustedSHA); err != nil {
 		return nil, err
 	}
 	trustedRepoCfg := loadTrustedRepoConfig(ctx, workDir, trustedSHA, run.ID)
@@ -743,6 +748,10 @@ func loadTrustedRepoConfig(ctx context.Context, wtDir, trustedSHA, runID string)
 // repo relies on the boundary, so it refuses to run rather than risk launching a
 // gate agent with the project instructions loaded.
 //
+// Every caller reads the same trusted copy for a different reason, so subject
+// names the boundary the caller could not evaluate rather than assuming the
+// opt-out.
+//
 // It distinguishes "could not read the trusted config at all" (abort) from
 // "read the trusted tree fine, there is simply no .no-mistakes.yaml on the
 // default branch" (the common ordinary-repo case, which is NOT opted out and
@@ -751,29 +760,29 @@ func loadTrustedRepoConfig(ctx context.Context, wtDir, trustedSHA, runID string)
 //   - the default branch could not be fetched/resolved to a pinned SHA,
 //   - the pinned commit or tree is not readable (missing object / partial fetch),
 //   - the trusted .no-mistakes.yaml is present but unreadable or unparseable.
-func assertGateTrustedConfigReadable(ctx context.Context, wtDir, defaultBranch, trustedSHA string) error {
+func assertGateTrustedConfigReadable(ctx context.Context, wtDir, subject, defaultBranch, trustedSHA string) error {
 	if defaultBranch == "" {
-		return fmt.Errorf("cannot evaluate disable_project_settings: repository has no known default branch to read trusted config from")
+		return fmt.Errorf("cannot evaluate %s: repository has no known default branch to read trusted config from", subject)
 	}
 	if trustedSHA == "" {
-		return fmt.Errorf("cannot evaluate disable_project_settings: failed to fetch or resolve trusted default branch %q (refusing to run without reading the trusted config)", defaultBranch)
+		return fmt.Errorf("cannot evaluate %s: failed to fetch or resolve trusted default branch %q (refusing to run without reading the trusted config)", subject, defaultBranch)
 	}
 	if _, err := git.Run(ctx, wtDir, "rev-parse", "-q", "--verify", trustedSHA+"^{commit}"); err != nil {
-		return fmt.Errorf("cannot evaluate disable_project_settings: trusted default-branch commit %s is not readable: %w", trustedSHA, err)
+		return fmt.Errorf("cannot evaluate %s: trusted default-branch commit %s is not readable: %w", subject, trustedSHA, err)
 	}
 	entry, err := git.Run(ctx, wtDir, "ls-tree", trustedSHA, "--", ".no-mistakes.yaml")
 	if err != nil {
-		return fmt.Errorf("cannot evaluate disable_project_settings: trusted default-branch tree at %s is not readable: %w", trustedSHA, err)
+		return fmt.Errorf("cannot evaluate %s: trusted default-branch tree at %s is not readable: %w", subject, trustedSHA, err)
 	}
 	if entry == "" {
 		return nil
 	}
 	content, err := git.ShowFile(ctx, wtDir, trustedSHA, ".no-mistakes.yaml")
 	if err != nil {
-		return fmt.Errorf("cannot evaluate disable_project_settings: trusted .no-mistakes.yaml at %s is present but not readable: %w", trustedSHA, err)
+		return fmt.Errorf("cannot evaluate %s: trusted .no-mistakes.yaml at %s is present but not readable: %w", subject, trustedSHA, err)
 	}
 	if _, err := config.LoadRepoFromBytes([]byte(content)); err != nil {
-		return fmt.Errorf("cannot evaluate disable_project_settings: trusted .no-mistakes.yaml at %s is present but unparseable: %w", trustedSHA, err)
+		return fmt.Errorf("cannot evaluate %s: trusted .no-mistakes.yaml at %s is present but unparseable: %w", subject, trustedSHA, err)
 	}
 	return nil
 }
@@ -1029,7 +1038,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 	// commands/agent empty. An unreadable trusted tree aborts below.
 	// SECURITY: a trusted-config fetch failure must abort, not silently disable
 	// the disable_project_settings opt-out (see assertGateTrustedConfigReadable).
-	if err := assertGateTrustedConfigReadable(ctx, wtDir, repo.DefaultBranch, trustedSHA); err != nil {
+	if err := assertGateTrustedConfigReadable(ctx, wtDir, trustedConfigSubjectOptOut, repo.DefaultBranch, trustedSHA); err != nil {
 		m.db.UpdateRunError(run.ID, err.Error())
 		trackStartFailure("trusted_config_unreadable")
 		return "", err

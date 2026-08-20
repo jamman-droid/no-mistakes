@@ -97,6 +97,7 @@ func (c *Config) ResolveAgentWithReport(ctx context.Context, lookPath func(strin
 		Reviewer:    RoleResolution{Source: c.AgentRoleSources.Reviewer, Candidates: c.configuredCandidateResolutions(configuredRoles.Reviewer)},
 		Implementer: RoleResolution{Source: c.AgentRoleSources.Implementer, Candidates: c.configuredCandidateResolutions(configuredRoles.Implementer)},
 	}
+	memo := agentProbeMemo{}
 	if err := c.resolveDefaultAgent(ctx, lookPath); err != nil {
 		// Preserve host-observed unavailability even when the inherited default
 		// leaves the run with no runnable agent. Resolution still fails exactly
@@ -112,11 +113,14 @@ func (c *Config) ResolveAgentWithReport(ctx context.Context, lookPath func(strin
 			if len(candidates) == 0 || roleSelectionMatchesAgents(candidates, configuredDefault) {
 				candidates = roleSelectionFromAgents(configuredDefault)
 			}
-			_, candidateReport, _ := c.resolveRoleSelectionWithReport(ctx, candidates, lookPath)
+			_, candidateReport, _ := c.resolveRoleSelectionWithReport(ctx, memo, candidates, lookPath)
 			role.report.Candidates = candidateReport
 		}
 		c.AgentRoleResolution = &report
 		return report, err
+	}
+	for _, name := range c.Agents {
+		memo[name] = agentProbeResult{name: name, available: true}
 	}
 
 	for _, role := range []struct {
@@ -135,7 +139,7 @@ func (c *Config) ResolveAgentWithReport(ctx context.Context, lookPath func(strin
 		if roleSelectionMatchesAgents(candidates, configuredDefault) && len(configuredDefault) == 1 && configuredDefault[0] == types.AgentAuto {
 			candidates = roleSelectionFromAgents(c.Agents)
 		}
-		resolved, candidateReport, err := c.resolveRoleSelectionWithReport(ctx, candidates, lookPath)
+		resolved, candidateReport, err := c.resolveRoleSelectionWithReport(ctx, memo, candidates, lookPath)
 		role.report.Candidates = candidateReport
 		if err != nil {
 			c.AgentRoleResolution = &report
@@ -147,7 +151,31 @@ func (c *Config) ResolveAgentWithReport(ctx context.Context, lookPath func(strin
 	return report, nil
 }
 
-func (c *Config) resolveRoleSelectionWithReport(ctx context.Context, candidates RoleSelection, lookPath func(string) (string, error)) (RoleSelection, []AgentCandidateResolution, error) {
+// agentProbeMemo caches one resolution pass's executable probes so the default
+// seat and both role seats never spawn the same probe subprocess twice. Seeding
+// it with an already-resolved harness is sound because resolveDefaultAgent only
+// returns names whose probe already succeeded.
+type agentProbeMemo map[types.AgentName]agentProbeResult
+
+type agentProbeResult struct {
+	name      types.AgentName
+	available bool
+	probe     string
+	err       error
+}
+
+func (c *Config) probeConfiguredAgent(ctx context.Context, memo agentProbeMemo, declared types.AgentName, lookPath func(string) (string, error)) (types.AgentName, bool, string, error) {
+	if cached, ok := memo[declared]; ok {
+		return cached.name, cached.available, cached.probe, cached.err
+	}
+	name, available, probe, err := c.resolveConfiguredAgent(ctx, declared, lookPath)
+	if memo != nil {
+		memo[declared] = agentProbeResult{name: name, available: available, probe: probe, err: err}
+	}
+	return name, available, probe, err
+}
+
+func (c *Config) resolveRoleSelectionWithReport(ctx context.Context, memo agentProbeMemo, candidates RoleSelection, lookPath func(string) (string, error)) (RoleSelection, []AgentCandidateResolution, error) {
 	resolved := make(RoleSelection, 0, len(candidates))
 	report := make([]AgentCandidateResolution, 0, len(candidates))
 	seen := make(map[string]bool, len(candidates))
@@ -156,7 +184,7 @@ func (c *Config) resolveRoleSelectionWithReport(ctx context.Context, candidates 
 	for index, declared := range candidates {
 		configured = append(configured, declared.Harness)
 		candidate := declared
-		name, ok, probe, err := c.resolveConfiguredAgent(ctx, candidate.Harness, lookPath)
+		name, ok, probe, err := c.probeConfiguredAgent(ctx, memo, candidate.Harness, lookPath)
 		if probe != "" {
 			probed = append(probed, probe)
 		}

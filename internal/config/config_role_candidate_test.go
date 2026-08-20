@@ -294,6 +294,29 @@ func TestEffectiveAgentRolePolicyFingerprintsCompleteLaunchArguments(t *testing.
 	}
 }
 
+func TestResolveAgentWithReportProbesEachHarnessOncePerResolution(t *testing.T) {
+	probes := map[string]int{}
+	cfg := &Config{Agent: types.AgentClaude, Agents: []types.AgentName{types.AgentClaude}}
+	report, err := cfg.ResolveAgentWithReport(context.Background(), func(bin string) (string, error) {
+		probes[bin]++
+		return "/usr/bin/" + bin, nil
+	})
+	if err != nil {
+		t.Fatalf("ResolveAgentWithReport: %v", err)
+	}
+	if probes["claude"] != 1 {
+		t.Fatalf("claude probed %d times across the default and both role seats, want 1", probes["claude"])
+	}
+	for _, role := range []RoleResolution{report.Reviewer, report.Implementer} {
+		if len(role.Candidates) != 1 || role.Candidates[0].Harness != types.AgentClaude || role.Candidates[0].Status != AgentCandidateAvailable {
+			t.Fatalf("inherited role evidence = %+v", role.Candidates)
+		}
+	}
+	if len(cfg.AgentRoles.Reviewer) != 1 || cfg.AgentRoles.Reviewer[0].Harness != types.AgentClaude {
+		t.Fatalf("resolved reviewer selection = %+v", cfg.AgentRoles.Reviewer)
+	}
+}
+
 func TestResolveAgentWithReportRetainsUnavailableAndDuplicateCandidates(t *testing.T) {
 	secret := "candidate-secret-must-not-leak"
 	cfg := &Config{

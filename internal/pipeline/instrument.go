@@ -76,7 +76,10 @@ func (a *perfRecordingAgent) Run(ctx context.Context, opts agent.RunOpts) (*agen
 		}
 	}
 	if persistenceErr != nil {
-		return result, errors.Join(err, &attemptEvidencePersistenceError{err: persistenceErr})
+		if err != nil {
+			return result, errors.Join(err, persistenceErr)
+		}
+		return result, &attemptEvidencePersistenceError{err: persistenceErr}
 	}
 	return result, err
 }

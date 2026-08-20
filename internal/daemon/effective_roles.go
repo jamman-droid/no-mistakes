@@ -9,6 +9,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 )
 
 // EffectiveAgentRoles is the precedence-resolved role policy for one exact
@@ -39,18 +40,24 @@ func ResolveEffectiveAgentRoles(ctx context.Context, p *paths.Paths, repo *db.Re
 	}
 
 	var trustedSHA string
+	var pinReason error
 	if repo.DefaultBranch != "" {
 		fetchCtx, cancel := context.WithTimeout(ctx, recoveredConfigFetchTimeout)
 		defer cancel()
 		if err := fetchRecoveredRemoteBranch(fetchCtx, workDir, "origin", repo.DefaultBranch); err != nil {
 			slog.Warn("failed to fetch default branch for effective role query", "branch", repo.DefaultBranch, "error", err)
+			pinReason = fmt.Errorf("fetch: %s", safeurl.RedactText(err.Error()))
 		} else if sha, err := git.ResolveRef(ctx, workDir, "refs/remotes/origin/"+repo.DefaultBranch); err != nil {
 			slog.Warn("failed to resolve default branch for effective role query", "branch", repo.DefaultBranch, "error", err)
+			pinReason = fmt.Errorf("resolve: %s", safeurl.RedactText(err.Error()))
 		} else {
 			trustedSHA = sha
 		}
 	}
-	if err := assertGateTrustedConfigReadable(ctx, workDir, repo.DefaultBranch, trustedSHA); err != nil {
+	if err := assertGateTrustedConfigReadable(ctx, workDir, trustedConfigSubjectRoles, repo.DefaultBranch, trustedSHA); err != nil {
+		if pinReason != nil {
+			return nil, fmt.Errorf("%w (%w)", err, pinReason)
+		}
 		return nil, err
 	}
 	trustedRepoCfg := loadTrustedRepoConfig(ctx, workDir, trustedSHA, "effective-role-query")

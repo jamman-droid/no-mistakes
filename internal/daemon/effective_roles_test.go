@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
@@ -63,6 +64,40 @@ func TestResolveEffectiveAgentRolesUsesPinnedTrustedPrecedenceWithoutAvailabilit
 	}
 	if got.Candidates[0].Status != config.AgentCandidateConfigured {
 		t.Fatalf("effective query performed host availability resolution: %+v", got.Candidates[0])
+	}
+}
+
+func TestResolveEffectiveAgentRolesFailsClosedNamingTheRoleQuery(t *testing.T) {
+	repoDir := t.TempDir()
+	gitCmd(t, repoDir, "init", "--initial-branch=main")
+	gitCmd(t, repoDir, "config", "user.email", "test@example.com")
+	gitCmd(t, repoDir, "config", "user.name", "Test")
+	gitCmd(t, repoDir, "config", "commit.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repoDir, "add", ".")
+	gitCmd(t, repoDir, "commit", "-m", "initial")
+
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p.ConfigFile(), []byte("agent: claude\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ResolveEffectiveAgentRoles(context.Background(), p, &db.Repo{ID: "repo", WorkingPath: repoDir, DefaultBranch: "main"}, repoDir)
+	if err == nil {
+		t.Fatal("an unreachable trusted default branch must fail the role query closed")
+	}
+	if strings.Contains(err.Error(), "disable_project_settings") {
+		t.Fatalf("role query error names an unrelated setting: %v", err)
+	}
+	if !strings.Contains(err.Error(), "effective agent roles") {
+		t.Fatalf("role query error does not name role resolution: %v", err)
+	}
+	if !strings.Contains(err.Error(), "fetch:") {
+		t.Fatalf("role query error hides the cause that made the trusted pin unavailable: %v", err)
 	}
 }
 
