@@ -372,3 +372,55 @@ func TestResolveAgentWithReportRetainsUnavailableAndDuplicateCandidates(t *testi
 		t.Fatal("resolution snapshot lost redacted argument identity")
 	}
 }
+
+// A host where no configured harness is installed never constructs an adapter,
+// so the resolution report is the only evidence the run can ever persist. It
+// must still name every configured candidate and stay redacted.
+func TestResolveAgentWithReportKeepsCompleteEvidenceWhenNothingIsRunnable(t *testing.T) {
+	secret := "candidate-secret-must-not-leak"
+	cfg := &Config{
+		Agent:  types.AgentClaude,
+		Agents: []types.AgentName{types.AgentClaude},
+		AgentRoles: AgentRoles{
+			Reviewer: RoleSelection{
+				{Harness: types.AgentPi, Provider: "openai", Model: "gpt-5.4", Args: []string{"--token", secret}},
+				{Harness: types.AgentOpenCode, Model: "fallback"},
+			},
+			Implementer: RoleSelection{{Harness: types.AgentClaude, Provider: "anthropic", Model: "claude-opus-5"}},
+		},
+	}
+
+	report, err := cfg.ResolveAgentWithReport(context.Background(), func(string) (string, error) {
+		return "", exec.ErrNotFound
+	})
+	if err == nil {
+		t.Fatal("resolution succeeded with no installed harness")
+	}
+	if cfg.AgentRoleResolution == nil {
+		t.Fatal("failed resolution left no snapshot on the config for the run to persist")
+	}
+	for name, role := range map[string]RoleResolution{"reviewer": report.Reviewer, "implementer": report.Implementer} {
+		want := len(cfg.AgentRoles.Reviewer)
+		if name == "implementer" {
+			want = len(cfg.AgentRoles.Implementer)
+		}
+		if len(role.Candidates) != want {
+			t.Fatalf("%s evidence = %+v, want all %d configured candidates", name, role.Candidates, want)
+		}
+		for _, candidate := range role.Candidates {
+			if candidate.Status != AgentCandidateUnavailable || candidate.Reason != AgentCandidateReasonExecutableNotFound {
+				t.Fatalf("%s candidate %d = %+v, want an unavailable host observation", name, candidate.Index, candidate)
+			}
+		}
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), "--token") {
+		t.Fatalf("failed-resolution snapshot exposes raw arguments: %s", encoded)
+	}
+	if report.Reviewer.Candidates[0].ArgsSHA256 == "" {
+		t.Fatal("failed-resolution snapshot lost redacted argument identity")
+	}
+}
