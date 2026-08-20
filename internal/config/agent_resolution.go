@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -197,20 +198,33 @@ func (c *Config) candidateResolution(index int, candidate AgentCandidate, status
 
 func safeEvidenceHarness(harness types.AgentName) types.AgentName {
 	value := string(harness)
-	if safeEvidenceIdentity(value) != "" {
+	if safeEvidenceIdentityToken(value) {
 		return harness
 	}
-	if target, ok := types.ACPTargetFor(harness); ok && safeEvidenceIdentity(target) != "" {
+	if target, ok := types.ACPTargetFor(harness); ok && safeEvidenceIdentityToken(target) {
 		return types.AgentName("acp:" + target)
 	}
 	return types.AgentName("redacted-" + evidenceIdentityHash(value))
 }
 
+// safeEvidenceIdentity is the emission boundary, not the parse boundary: it is
+// deliberately narrower than safeAgentIdentityToken so a configured identity can
+// never carry ':' or '@' into evidence. A value it refuses collapses to a stable
+// per-value fingerprint rather than an empty string, because the result also
+// identifies a candidate (AgentCandidate.Label backs session ownership and
+// attempt attribution) and two distinct candidates must never share one label.
 func safeEvidenceIdentity(value string) string {
-	if value == "" || !safeAgentIdentityToken(value) {
+	if value == "" {
 		return ""
 	}
+	if !safeEvidenceIdentityToken(value) {
+		return "redacted-" + evidenceIdentityHash(value)
+	}
 	return value
+}
+
+func safeEvidenceIdentityToken(value string) bool {
+	return safeAgentIdentityToken(value) && !strings.ContainsAny(value, ":@")
 }
 
 func evidenceIdentityHash(value string) string {

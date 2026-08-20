@@ -98,6 +98,69 @@ func TestLoadAgentRoles_RejectsInvalidStructuredCandidates(t *testing.T) {
 	}
 }
 
+func TestLoadAgentRoles_AcceptsLegacyVersionSeparatorIdentities(t *testing.T) {
+	cfg, err := LoadGlobalFromBytes([]byte(`agent_roles:
+  reviewer:
+    - harness: pi
+      provider: ollama
+      model: 'llama3:8b'
+    - harness: pi
+      provider: vertex
+      model: 'claude-3-7@20250219'
+`))
+	if err != nil {
+		t.Fatalf("LoadGlobalFromBytes: %v", err)
+	}
+	if len(cfg.AgentRoles.Reviewer) != 2 {
+		t.Fatalf("reviewer candidates = %+v, want 2", cfg.AgentRoles.Reviewer)
+	}
+	if got := cfg.AgentRoles.Reviewer[0]; got.Provider != "ollama" || got.Model != "llama3:8b" {
+		t.Fatalf("first reviewer candidate = %+v", got)
+	}
+	if got := cfg.AgentRoles.Reviewer[1]; got.Provider != "vertex" || got.Model != "claude-3-7@20250219" {
+		t.Fatalf("second reviewer candidate = %+v", got)
+	}
+}
+
+func TestAgentCandidateLabelRedactsUnsafeIdentityWithoutCollapsingCandidates(t *testing.T) {
+	first := AgentCandidate{Harness: types.AgentPi, Provider: "ollama", Model: "llama3:8b"}
+	second := AgentCandidate{Harness: types.AgentPi, Provider: "ollama", Model: "llama3:70b"}
+	firstLabel, secondLabel := first.Label(), second.Label()
+	if strings.Contains(firstLabel, "llama3:8b") || strings.Contains(secondLabel, "llama3:70b") {
+		t.Fatalf("labels leaked raw model identity: %q/%q", firstLabel, secondLabel)
+	}
+	if firstLabel == secondLabel {
+		t.Fatalf("distinct candidates collapsed to one label: %q", firstLabel)
+	}
+	if bare := (AgentCandidate{Harness: types.AgentPi}).Label(); bare != "pi" {
+		t.Fatalf("legacy bare candidate label = %q", bare)
+	}
+}
+
+func TestEffectiveAgentRolePolicyRedactsUnsafeConfiguredIdentity(t *testing.T) {
+	cfg := &Config{AgentRoles: AgentRoles{Reviewer: RoleSelection{
+		{Harness: types.AgentPi, Provider: "ollama", Model: "llama3:8b"},
+		{Harness: types.AgentPi, Provider: "ollama", Model: "llama3:70b"},
+	}}}
+	candidates := cfg.EffectiveAgentRolePolicy().Reviewer.Candidates
+	if len(candidates) != 2 {
+		t.Fatalf("reviewer candidates = %+v, want 2", candidates)
+	}
+	if candidates[0].Model == "" || candidates[0].Model == candidates[1].Model {
+		t.Fatalf("redacted models = %q/%q", candidates[0].Model, candidates[1].Model)
+	}
+	encoded, err := json.Marshal(candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "llama3:8b") || strings.Contains(string(encoded), "llama3:70b") {
+		t.Fatalf("policy evidence exposed unsafe identity: %s", encoded)
+	}
+	if candidates[0].RuntimeLabel == candidates[1].RuntimeLabel {
+		t.Fatalf("runtime labels collapsed: %q", candidates[0].RuntimeLabel)
+	}
+}
+
 func TestResolveAgent_RetainsSameHarnessCandidatesWithDifferentModels(t *testing.T) {
 	cfg := &Config{
 		Agent:  types.AgentClaude,

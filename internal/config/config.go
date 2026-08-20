@@ -676,11 +676,22 @@ func decodeAgentCandidate(node *yaml.Node) (AgentCandidate, error) {
 	return candidate, nil
 }
 
+// safeAgentIdentityToken accepts the historical provider/model vocabulary,
+// including the ':' and '@' version separators real model IDs use (llama3:8b,
+// claude-3-7@20250219), while refusing the shapes that would smuggle a URL, a
+// credential, or a filesystem path into agent identity: a scheme or drive
+// separator (":/"), userinfo credentials (an '@' preceded by a ':'), backslashes,
+// absolute paths, and empty or dot path segments.
 func safeAgentIdentityToken(value string) bool {
 	if value == "" || len(value) > 128 || strings.TrimSpace(value) != value ||
-		strings.Contains(value, ":") || strings.Contains(value, "@") ||
-		strings.Contains(value, "\\") || strings.HasPrefix(value, "/") {
+		strings.Contains(value, ":/") || strings.Contains(value, "\\") ||
+		strings.HasPrefix(value, "/") {
 		return false
+	}
+	if at := strings.IndexByte(value, '@'); at >= 0 {
+		if colon := strings.IndexByte(value, ':'); colon >= 0 && colon < at {
+			return false
+		}
 	}
 	for _, segment := range strings.Split(value, "/") {
 		if segment == "" || segment == "." || segment == ".." {
@@ -688,7 +699,7 @@ func safeAgentIdentityToken(value string) bool {
 		}
 	}
 	for _, r := range value {
-		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._-/+", r) {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._-/:+@", r) {
 			continue
 		}
 		return false
