@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -91,8 +92,9 @@ func (rs *RunSessions) Run(ctx context.Context, a agent.Agent, role SessionRole,
 		rs.remember(role, result.SessionID, sessionProvider(a, result))
 		return result, nil
 	}
-	if storedID == "" || ctx.Err() != nil {
-		return nil, err
+	var evidenceErr *attemptEvidencePersistenceError
+	if storedID == "" || ctx.Err() != nil || errors.As(err, &evidenceErr) {
+		return result, err
 	}
 
 	// The resume attempt failed. Never skip the turn: drop the dead identity

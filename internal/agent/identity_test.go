@@ -76,6 +76,37 @@ func TestWithIdentityMakesSameHarnessFallbacksDistinctAndOrdered(t *testing.T) {
 	if result.Provider != second.Name() || result.Model != "claude-opus-4-6" || result.ModelProvider != "anthropic" {
 		t.Fatalf("result identity = %+v", result)
 	}
+	if provider, model := result.ObservedModelIdentity(); provider != "" || model != "" {
+		t.Fatalf("declared identity was fabricated as observed: %q/%q", provider, model)
+	}
+}
+
+func TestWithIdentityPreservesAdapterObservedModelSeparately(t *testing.T) {
+	wrapped := WithIdentity(
+		&identityTestAgent{name: "pi", result: &Result{ModelProvider: "runtime-provider", Model: "runtime-model"}},
+		Identity{Name: "candidate", ModelProvider: "declared-provider", Model: "declared-model"},
+	)
+	result, err := wrapped.Run(context.Background(), RunOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider, model := result.ObservedModelIdentity(); provider != "runtime-provider" || model != "runtime-model" {
+		t.Fatalf("observed identity = %q/%q", provider, model)
+	}
+	if result.ModelProvider != "runtime-provider" || result.Model != "runtime-model" {
+		t.Fatalf("effective identity changed adapter report: %+v", result)
+	}
+}
+
+func TestSafeObservedIdentityRejectsPublicBoundaryContent(t *testing.T) {
+	if got, ok := SafeObservedIdentity("openai/gpt-5.6-sol"); !ok || got != "openai/gpt-5.6-sol" {
+		t.Fatalf("safe observed identity = %q/%v", got, ok)
+	}
+	for _, unsafe := range []string{"https://user:secret@example.com/model", "file:/etc/passwd", "C:/Users/alice/.ssh/key", "/Users/test/model", "models/../../Users/alice/key", "../secret", "provider@example.com", "model with output", strings.Repeat("x", 129)} {
+		if got, ok := SafeObservedIdentity(unsafe); ok {
+			t.Fatalf("unsafe observed identity %q accepted as %q", unsafe, got)
+		}
+	}
 }
 
 func TestWithIdentityRedactsLaunchArgumentsAtEveryOutputBoundary(t *testing.T) {

@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS runs (
     error                   TEXT,
     awaiting_agent_since INTEGER,
     parked_ms            INTEGER,
+    agent_role_snapshot      TEXT,
+    agent_role_snapshot_hash TEXT,
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL
 );
@@ -86,6 +88,13 @@ CREATE TABLE IF NOT EXISTS agent_invocations (
     round                 INTEGER NOT NULL,
     purpose               TEXT NOT NULL,
     agent                 TEXT NOT NULL,
+    role                  TEXT,
+    candidate_index       INTEGER,
+    declared_harness      TEXT,
+    declared_provider     TEXT,
+    declared_model        TEXT,
+    observed_provider     TEXT,
+    observed_model        TEXT,
     model                 TEXT,
     model_provider        TEXT,
     session_mode          TEXT NOT NULL,
@@ -163,6 +172,10 @@ var migrationStatements = []string{
 	`ALTER TABLE runs ADD COLUMN intent_score REAL`,
 	`ALTER TABLE runs ADD COLUMN awaiting_agent_since INTEGER`,
 	`ALTER TABLE runs ADD COLUMN parked_ms INTEGER`,
+	// A redacted, versioned startup resolution snapshot preserves candidates
+	// that were unavailable before an adapter could be constructed.
+	`ALTER TABLE runs ADD COLUMN agent_role_snapshot TEXT`,
+	`ALTER TABLE runs ADD COLUMN agent_role_snapshot_hash TEXT`,
 	// The CI step's per-check rerun budget. It is durable because a run
 	// recovered after a daemon restart would otherwise get a fresh budget and
 	// could issue reruns beyond the documented limit; the reservation is
@@ -202,6 +215,13 @@ var migrationStatements = []string{
 	// Session-fidelity telemetry columns (all nullable so pre-existing rows read
 	// back as unknown, never a fabricated zero).
 	`ALTER TABLE agent_invocations ADD COLUMN model_provider TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN role TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN candidate_index INTEGER`,
+	`ALTER TABLE agent_invocations ADD COLUMN declared_harness TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN declared_provider TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN declared_model TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN observed_provider TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN observed_model TEXT`,
 	`ALTER TABLE agent_invocations ADD COLUMN fallback_reason TEXT`,
 	`ALTER TABLE agent_invocations ADD COLUMN subprocess_wait_ms INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN fresh_input_tokens INTEGER`,

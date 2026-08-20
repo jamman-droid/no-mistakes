@@ -2,6 +2,9 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -167,6 +170,10 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if err != nil {
 		return nil, err
 	}
+	if err := validateRecoveredAgentRoleResolution(run, cfg); err != nil {
+		_ = agents.Close()
+		return nil, err
+	}
 	if cfg.SessionReuse {
 		if err := validateRecoveredSessionProviders(m.db, run.ID, agents.Roles.Implementer); err != nil {
 			_ = agents.Close()
@@ -182,6 +189,26 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 		agents:  agents,
 		steps:   execSteps,
 	}, nil
+}
+
+func validateRecoveredAgentRoleResolution(run *db.Run, cfg *config.Config) error {
+	// Legacy runs predate Slice 1 evidence and remain recoverable, but their
+	// attestation explicitly reports that no startup snapshot was captured.
+	if run == nil || run.AgentRoleSnapshot == nil {
+		return nil
+	}
+	if run.AgentRoleSnapshotHash == nil || cfg == nil || cfg.AgentRoleResolution == nil {
+		return fmt.Errorf("recovered run has incomplete agent role resolution evidence")
+	}
+	encoded, err := json.Marshal(cfg.AgentRoleResolution)
+	if err != nil {
+		return fmt.Errorf("serialize recovered agent role resolution: %w", err)
+	}
+	sum := sha256.Sum256(encoded)
+	if string(encoded) != *run.AgentRoleSnapshot || hex.EncodeToString(sum[:]) != *run.AgentRoleSnapshotHash {
+		return fmt.Errorf("recovered agent role resolution differs from the immutable startup snapshot; refusing ambiguous candidate attribution")
+	}
+	return nil
 }
 
 func validateRecoveredSessionProviders(database *db.DB, runID string, ag agent.Agent) error {
@@ -230,9 +257,7 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 		return nil, err
 	}
 	trustedRepoCfg := loadTrustedRepoConfig(ctx, workDir, trustedSHA, run.ID)
-	allowRepoCommands := trustedRepoCfg != nil && trustedRepoCfg.AllowRepoCommands
-	effectiveRepoCfg := config.EffectiveRepoConfig(repoCfg, trustedRepoCfg, allowRepoCommands)
-	cfg := config.Merge(globalCfg, effectiveRepoCfg)
+	cfg, effectiveRepoCfg, _ := mergeEffectiveAgentConfig(globalCfg, repoCfg, trustedRepoCfg)
 	cfg.TrustedConfigSHA = trustedSHA
 	if globalCfg.Eval.CaptureProvenance {
 		if err := cfg.EnableEvalProvenance(globalCfg, effectiveRepoCfg); err != nil {
@@ -240,6 +265,18 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 		}
 	}
 	return cfg, nil
+}
+
+func persistRunAgentRoleResolution(database *db.DB, runID string, resolution config.AgentRoleResolution) error {
+	encoded, err := json.Marshal(resolution)
+	if err != nil {
+		return fmt.Errorf("serialize agent role resolution: %w", err)
+	}
+	sum := sha256.Sum256(encoded)
+	if err := database.SetRunAgentRoleSnapshot(runID, string(encoded), hex.EncodeToString(sum[:])); err != nil {
+		return fmt.Errorf("persist agent role resolution: %w", err)
+	}
+	return nil
 }
 
 type pipelineAgentSet struct {
@@ -262,13 +299,20 @@ func (s *pipelineAgentSet) Close() error {
 
 func newPipelineAgents(ctx context.Context, cfg *config.Config, lookPath func(string) (string, error)) (*pipelineAgentSet, error) {
 	if steps.IsDemoMode() {
+		if cfg.AgentRoleResolution == nil {
+			policy := cfg.EffectiveAgentRolePolicy()
+			cfg.AgentRoleResolution = &policy
+		}
 		noop := agent.NewNoop()
 		return &pipelineAgentSet{Roles: pipeline.AgentRoles{Implementer: noop, Reviewer: noop}, owned: []agent.Agent{noop}}, nil
 	}
-	if err := cfg.ResolveAgent(ctx, lookPath); err != nil {
+	if _, err := cfg.ResolveAgentWithReport(ctx, lookPath); err != nil {
 		return nil, err
 	}
+	return newResolvedPipelineAgents(cfg)
+}
 
+func newResolvedPipelineAgents(cfg *config.Config) (*pipelineAgentSet, error) {
 	set := &pipelineAgentSet{}
 	createdBySelection := make(map[string]agent.Agent, 2)
 	createRole := func(role string, candidates config.RoleSelection) (agent.Agent, error) {
@@ -991,8 +1035,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		return "", err
 	}
 	trustedRepoCfg := loadTrustedRepoConfig(ctx, wtDir, trustedSHA, run.ID)
-	allowRepoCommands := trustedRepoCfg != nil && trustedRepoCfg.AllowRepoCommands
-	effectiveRepoCfg := config.EffectiveRepoConfig(repoCfg, trustedRepoCfg, allowRepoCommands)
+	cfg, effectiveRepoCfg, allowRepoCommands := mergeEffectiveAgentConfig(globalCfg, repoCfg, trustedRepoCfg)
 	if allowRepoCommands {
 		slog.Warn("allow_repo_commands is enabled on the default branch: honoring commands/agent/agent_roles from pushed branch", "run_id", run.ID, "branch", branch)
 	} else if repoCfg.Commands != effectiveRepoCfg.Commands || repoCfg.Agent != effectiveRepoCfg.Agent || !agentListsEqual(repoCfg.Agents, effectiveRepoCfg.Agents) || !agentRolesEqual(repoCfg.AgentRoles, effectiveRepoCfg.AgentRoles) {
@@ -1001,7 +1044,6 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		// This is not an error: it is the secure default in action.
 		slog.Info("repo commands/agent/agent_roles loaded from default branch, not pushed branch", "run_id", run.ID, "branch", branch, "default_branch", repo.DefaultBranch)
 	}
-	cfg := config.Merge(globalCfg, effectiveRepoCfg)
 	cfg.TrustedConfigSHA = trustedSHA
 	if globalCfg.Eval.CaptureProvenance {
 		if err := cfg.EnableEvalProvenance(globalCfg, effectiveRepoCfg); err != nil {
@@ -1011,10 +1053,33 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		}
 	}
 
-	// Resolve and construct both ordinary supervised package-agent seats. Exact
-	// matching selections share one composite adapter, preserving the historical
-	// single-agent process behavior by default.
-	agents, err := newPipelineAgents(ctx, cfg, exec.LookPath)
+	// Persist the complete redacted host resolution before constructing an
+	// adapter. Unavailable and duplicate candidates never reach invocation
+	// callbacks, so this is their durable evidence boundary.
+	resolution := cfg.EffectiveAgentRolePolicy()
+	var resolutionErr error
+	if !steps.IsDemoMode() {
+		resolution, resolutionErr = cfg.ResolveAgentWithReport(ctx, exec.LookPath)
+	}
+	if err := persistRunAgentRoleResolution(m.db, run.ID, resolution); err != nil {
+		m.db.UpdateRunError(run.ID, err.Error())
+		trackStartFailure("persist_agent_role_resolution")
+		return "", err
+	}
+	if resolutionErr != nil {
+		m.db.UpdateRunError(run.ID, resolutionErr.Error())
+		trackStartFailure("resolve_or_create_agent_roles")
+		return "", resolutionErr
+	}
+
+	// Exact matching selections share one composite adapter, preserving the
+	// historical single-agent process behavior by default.
+	var agents *pipelineAgentSet
+	if steps.IsDemoMode() {
+		agents, err = newPipelineAgents(ctx, cfg, exec.LookPath)
+	} else {
+		agents, err = newResolvedPipelineAgents(cfg)
+	}
 	if err != nil {
 		m.db.UpdateRunError(run.ID, err.Error())
 		trackStartFailure("resolve_or_create_agent_roles")

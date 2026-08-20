@@ -6,25 +6,35 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 // perfRecordingAgent decorates the step agent to persist one local
 // agent_invocations row per invocation: identity, purpose, session mode,
-// timing, exit status, and token usage. Recording is local-only and
-// best-effort: a failed insert never fails the invocation, and no
-// per-invocation record leaves the machine.
+// timing, exit status, and token usage. Recording is local-only. For pipeline
+// roles it is also an attestation boundary: a failed insert fails the wrapper
+// after the concrete attempt returns rather than silently claiming complete
+// evidence. No per-invocation record leaves the machine.
+type attemptEvidencePersistenceError struct{ err error }
+
+func (e *attemptEvidencePersistenceError) Error() string { return e.err.Error() }
+func (e *attemptEvidencePersistenceError) Unwrap() error { return e.err }
+
 type perfRecordingAgent struct {
-	inner    agent.Agent
-	db       *db.DB
-	runID    string
-	stepName types.StepName
+	inner      agent.Agent
+	db         *db.DB
+	runID      string
+	stepName   types.StepName
+	role       string
+	candidates []config.AgentCandidateResolution
 	// round returns the 1-based round the current invocation belongs to.
 	round func() int
 }
@@ -44,6 +54,7 @@ func (a *perfRecordingAgent) SupportsSessionProvider(provider string) bool {
 
 func (a *perfRecordingAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
 	attempts := 0
+	var persistenceErr error
 	previous := opts.OnAttempt
 	opts.OnAttempt = func(attempt agent.Attempt) {
 		if previous != nil {
@@ -53,19 +64,26 @@ func (a *perfRecordingAgent) Run(ctx context.Context, opts agent.RunOpts) (*agen
 		attemptOpts := opts
 		attemptOpts.Session = attempt.Session
 		attemptOpts.SessionFallback = attempt.SessionFallback
-		a.record(ctx, attemptOpts, attempt.Agent, attempt.Result, attempt.Err, attempt.StartedAt, attempt.CompletedAt)
+		if err := a.record(ctx, attemptOpts, attempt.Agent, attempt.Result, attempt.Err, attempt.StartedAt, attempt.CompletedAt); err != nil {
+			persistenceErr = errors.Join(persistenceErr, err)
+		}
 	}
 	start := time.Now()
 	result, err := a.inner.Run(ctx, opts)
 	if attempts == 0 {
-		a.record(ctx, opts, a.inner.Name(), result, err, start, time.Now())
+		if recordErr := a.record(ctx, opts, a.inner.Name(), result, err, start, time.Now()); recordErr != nil {
+			persistenceErr = errors.Join(persistenceErr, recordErr)
+		}
+	}
+	if persistenceErr != nil {
+		return result, errors.Join(err, &attemptEvidencePersistenceError{err: persistenceErr})
 	}
 	return result, err
 }
 
-func (a *perfRecordingAgent) record(ctx context.Context, opts agent.RunOpts, agentName string, result *agent.Result, runErr error, startedAt, completedAt time.Time) {
+func (a *perfRecordingAgent) record(ctx context.Context, opts agent.RunOpts, agentName string, result *agent.Result, runErr error, startedAt, completedAt time.Time) error {
 	if a.db == nil {
-		return
+		return nil
 	}
 
 	purpose := opts.Purpose
@@ -74,12 +92,14 @@ func (a *perfRecordingAgent) record(ctx context.Context, opts agent.RunOpts, age
 	}
 
 	sessionKey := invocationSessionKey(opts, result)
+	role := a.role
 	inv := db.AgentInvocation{
 		RunID:       a.runID,
 		StepName:    string(a.stepName),
 		Round:       a.round(),
 		Purpose:     purpose,
 		Agent:       agentName,
+		Role:        &role,
 		SessionMode: invocationSessionMode(opts),
 		SessionKey:  sessionKey,
 		StartedAt:   startedAt.Unix(),
@@ -87,6 +107,7 @@ func (a *perfRecordingAgent) record(ctx context.Context, opts agent.RunOpts, age
 		DurationMS:  completedAt.Sub(startedAt).Milliseconds(),
 		ExitStatus:  "ok",
 	}
+	a.applyCandidateIdentity(&inv, agentName)
 	if opts.SessionFallback && opts.SessionFallbackReason != "" {
 		reason := opts.SessionFallbackReason
 		inv.FallbackReason = &reason
@@ -109,13 +130,36 @@ func (a *perfRecordingAgent) record(ctx context.Context, opts agent.RunOpts, age
 
 	if _, dbErr := a.db.InsertAgentInvocation(inv); dbErr != nil {
 		slog.Warn("failed to record agent invocation", "step", a.stepName, "error", dbErr)
+		return fmt.Errorf("persist %s agent attempt evidence: %w", a.stepName, dbErr)
 	}
+	return nil
 }
 
 // recordResult folds a successful (or partially successful) result's identity,
 // usage, per-round token deltas, and bounded activity metrics into inv. Every
 // field the adapter did not report is left nil so it is stored as unknown
 // rather than a fabricated zero.
+func (a *perfRecordingAgent) applyCandidateIdentity(inv *db.AgentInvocation, agentName string) {
+	for _, candidate := range a.candidates {
+		if candidate.RuntimeLabel != agentName {
+			continue
+		}
+		index := candidate.Index
+		inv.CandidateIndex = &index
+		harness := string(candidate.Harness)
+		inv.DeclaredHarness = &harness
+		if candidate.Provider != "" {
+			provider := candidate.Provider
+			inv.DeclaredProvider = &provider
+		}
+		if candidate.Model != "" {
+			model := candidate.Model
+			inv.DeclaredModel = &model
+		}
+		return
+	}
+}
+
 func (a *perfRecordingAgent) recordResult(inv *db.AgentInvocation, sessionKey string, result *agent.Result) {
 	if result == nil {
 		return
@@ -124,6 +168,13 @@ func (a *perfRecordingAgent) recordResult(inv *db.AgentInvocation, sessionKey st
 	if result.ModelProvider != "" {
 		provider := result.ModelProvider
 		inv.ModelProvider = &provider
+	}
+	observedProvider, observedModel := result.ObservedModelIdentity()
+	if safe, ok := agent.SafeObservedIdentity(observedProvider); ok {
+		inv.ObservedProvider = &safe
+	}
+	if safe, ok := agent.SafeObservedIdentity(observedModel); ok {
+		inv.ObservedModel = &safe
 	}
 	inv.InputTokens = result.Usage.InputTokens
 	inv.OutputTokens = result.Usage.OutputTokens

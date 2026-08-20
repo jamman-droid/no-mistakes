@@ -401,7 +401,12 @@ type Config struct {
 	Agents                []types.AgentName
 	// AgentRoles optionally selects independent ordered candidates for the
 	// reviewer and implementer seats. Empty role selections inherit Agent/Agents.
-	AgentRoles           AgentRoles
+	AgentRoles AgentRoles
+	// AgentRoleSources records which precedence layer supplied each effective
+	// role. AgentRoleResolution is populated by ResolveAgentWithReport and is
+	// safe to persist because it contains no raw candidate arguments.
+	AgentRoleSources     AgentRoleSources
+	AgentRoleResolution  *AgentRoleResolution
 	ACPXPath             string
 	ACPRegistryOverrides map[string]string
 	AgentPathOverride    map[string]string
@@ -672,11 +677,18 @@ func decodeAgentCandidate(node *yaml.Node) (AgentCandidate, error) {
 }
 
 func safeAgentIdentityToken(value string) bool {
-	if value == "" || len(value) > 128 {
+	if value == "" || len(value) > 128 || strings.TrimSpace(value) != value ||
+		strings.Contains(value, ":") || strings.Contains(value, "@") ||
+		strings.Contains(value, "\\") || strings.HasPrefix(value, "/") {
 		return false
 	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
 	for _, r := range value {
-		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._-/:+@", r) {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._-/+", r) {
 			continue
 		}
 		return false
@@ -687,10 +699,13 @@ func safeAgentIdentityToken(value string) bool {
 // Label is the bounded, argument-redacted candidate identity used in logs,
 // session ownership, fallback attempts, and durable invocation records.
 func (c AgentCandidate) Label() string {
-	if c.Provider == "" && c.Model == "" && len(c.Args) == 0 {
-		return string(c.Harness)
+	harness := string(safeEvidenceHarness(c.Harness))
+	provider := safeEvidenceIdentity(c.Provider)
+	model := safeEvidenceIdentity(c.Model)
+	if provider == "" && model == "" && len(c.Args) == 0 {
+		return harness
 	}
-	label := fmt.Sprintf("candidate[harness=%q;provider=%q;model=%q", string(c.Harness), c.Provider, c.Model)
+	label := fmt.Sprintf("candidate[harness=%q;provider=%q;model=%q", harness, provider, model)
 	if len(c.Args) > 0 {
 		label += ";args=" + candidateArgsFingerprint(c.Args)[:24]
 	}
@@ -2038,6 +2053,19 @@ func (c *Config) AutoFixLimit(step types.StepName) int {
 	}
 }
 
+func agentRoleSource(globalRole, repoRole RoleSelection, repoOverridesDefault bool) string {
+	if len(repoRole) > 0 {
+		return AgentRoleSourceRepositoryRole
+	}
+	if repoOverridesDefault {
+		return AgentRoleSourceRepositoryDefault
+	}
+	if len(globalRole) > 0 {
+		return AgentRoleSourceGlobalRole
+	}
+	return AgentRoleSourceGlobalDefault
+}
+
 func mergedAgentRoleSelection(globalRole, repoRole, base RoleSelection, repoOverridesDefault bool) RoleSelection {
 	if len(repoRole) > 0 {
 		return copyRoleSelection(repoRole)
@@ -2132,6 +2160,8 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 	}
 	cfg.AgentRoles.Reviewer = mergedAgentRoleSelection(global.AgentRoles.Reviewer, repo.AgentRoles.Reviewer, base, repoOverridesDefault)
 	cfg.AgentRoles.Implementer = mergedAgentRoleSelection(global.AgentRoles.Implementer, repo.AgentRoles.Implementer, base, repoOverridesDefault)
+	cfg.AgentRoleSources.Reviewer = agentRoleSource(global.AgentRoles.Reviewer, repo.AgentRoles.Reviewer, repoOverridesDefault)
+	cfg.AgentRoleSources.Implementer = agentRoleSource(global.AgentRoles.Implementer, repo.AgentRoles.Implementer, repoOverridesDefault)
 
 	return cfg
 }

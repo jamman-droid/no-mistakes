@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -115,6 +116,21 @@ func TestExecutor_RecordsAgentInvocationsLocally(t *testing.T) {
 	}
 }
 
+func TestPerfRecordingAgent_FailsClosedWhenAttemptEvidenceCannotPersist(t *testing.T) {
+	database, _, run, _ := setupTest(t)
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wrapped := &perfRecordingAgent{
+		inner: &fallbackUsageAgent{name: "codex", result: &agent.Result{Model: "test-model"}},
+		db:    database, runID: run.ID, stepName: types.StepReview, role: "reviewer",
+		round: func() int { return 1 },
+	}
+	if _, err := wrapped.Run(context.Background(), agent.RunOpts{Purpose: "review"}); err == nil || !strings.Contains(err.Error(), "attempt evidence") {
+		t.Fatalf("persistence failure = %v", err)
+	}
+}
+
 func TestPerfRecordingAgent_RecordsFallbackAttemptsSeparately(t *testing.T) {
 	database, _, run, _ := setupTest(t)
 	wrapped := &perfRecordingAgent{
@@ -165,7 +181,12 @@ func TestPerfRecordingAgent_DistinguishesSameHarnessCandidateAttempts(t *testing
 		db:       database,
 		runID:    run.ID,
 		stepName: types.StepReview,
-		round:    func() int { return 1 },
+		role:     "reviewer",
+		candidates: []config.AgentCandidateResolution{
+			{Index: 0, Harness: types.AgentPi, Provider: "openai", Model: "gpt-5.4", Label: "candidate-0", RuntimeLabel: first.Name(), Status: config.AgentCandidateAvailable},
+			{Index: 1, Harness: types.AgentPi, Provider: "openai", Model: "gpt-5.3", Label: "candidate-1", RuntimeLabel: second.Name(), Status: config.AgentCandidateAvailable},
+		},
+		round: func() int { return 1 },
 	}
 
 	if _, err := wrapped.Run(context.Background(), agent.RunOpts{Purpose: "review"}); err != nil {
@@ -191,6 +212,12 @@ func TestPerfRecordingAgent_DistinguishesSameHarnessCandidateAttempts(t *testing
 		got := invocations[i]
 		if got.Agent != expectation.agent || got.Model != expectation.model || got.ModelProvider == nil || *got.ModelProvider != expectation.provider || got.ExitStatus != expectation.status {
 			t.Fatalf("invocation[%d] = %+v, want %+v", i, got, expectation)
+		}
+		if got.Role == nil || *got.Role != "reviewer" || got.CandidateIndex == nil || *got.CandidateIndex != i || got.DeclaredHarness == nil || *got.DeclaredHarness != "pi" || got.DeclaredModel == nil || *got.DeclaredModel != expectation.model {
+			t.Fatalf("invocation[%d] candidate binding = %+v", i, got)
+		}
+		if got.ObservedProvider != nil || got.ObservedModel != nil {
+			t.Fatalf("invocation[%d] fabricated declared identity as observed: %+v", i, got)
 		}
 	}
 }

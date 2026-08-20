@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	"os/exec"
 	"reflect"
 	"strings"
@@ -84,6 +85,8 @@ func TestLoadAgentRoles_RejectsInvalidStructuredCandidates(t *testing.T) {
 		{name: "managed arg", yaml: "agent_roles:\n  reviewer: {harness: pi, args: [--mode, json]}\n", want: "managed by no-mistakes"},
 		{name: "acp args silently ignored", yaml: "agent_roles:\n  reviewer: {harness: 'acp:gemini', args: [--model, gemini]}\n", want: "not supported"},
 		{name: "unsafe identity", yaml: "agent_roles:\n  reviewer: {harness: pi, provider: 'openai\\nsecret'}\n", want: "provider"},
+		{name: "credential URL provider", yaml: "agent_roles:\n  reviewer: {harness: pi, provider: 'https://user:secret@example.com'}\n", want: "provider"},
+		{name: "path-like model", yaml: "agent_roles:\n  reviewer: {harness: pi, model: 'models/../../Users/alice/key'}\n", want: "model"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -127,8 +130,12 @@ func TestMerge_StructuredRoleCandidatePrecedencePreservesCompleteSeat(t *testing
 		}}},
 	}
 	repoDefault := &RepoConfig{Agent: types.AgentCodex, Agents: []types.AgentName{types.AgentCodex}}
-	if got := Merge(global, repoDefault).AgentRoles.Reviewer; len(got) != 1 || got[0].Harness != types.AgentCodex {
+	mergedDefault := Merge(global, repoDefault)
+	if got := mergedDefault.AgentRoles.Reviewer; len(got) != 1 || got[0].Harness != types.AgentCodex {
 		t.Fatalf("repository legacy agent did not override global role: %+v", got)
+	}
+	if mergedDefault.AgentRoleSources.Reviewer != AgentRoleSourceRepositoryDefault {
+		t.Fatalf("repository default source = %q", mergedDefault.AgentRoleSources.Reviewer)
 	}
 	repoRole := &RepoConfig{
 		Agent:  types.AgentCodex,
@@ -137,9 +144,17 @@ func TestMerge_StructuredRoleCandidatePrecedencePreservesCompleteSeat(t *testing
 			Harness: types.AgentPi, Provider: "repo", Model: "repo-model", Args: []string{"--model", "repo-model"},
 		}}},
 	}
-	got := Merge(global, repoRole).AgentRoles.Reviewer
+	mergedRole := Merge(global, repoRole)
+	got := mergedRole.AgentRoles.Reviewer
 	if len(got) != 1 || got[0].Provider != "repo" || got[0].Model != "repo-model" || !reflect.DeepEqual(got[0].Args, []string{"--model", "repo-model"}) {
 		t.Fatalf("repository role did not preserve complete candidate: %+v", got)
+	}
+	policy := mergedRole.EffectiveAgentRolePolicy()
+	if policy.Reviewer.Source != AgentRoleSourceRepositoryRole || len(policy.Reviewer.Candidates) != 1 || policy.Reviewer.Candidates[0].Status != "configured" {
+		t.Fatalf("effective reviewer policy = %+v", policy.Reviewer)
+	}
+	if strings.Contains(policy.Reviewer.Candidates[0].Label, "repo-model") && strings.Contains(policy.Reviewer.Candidates[0].Label, "--model") {
+		t.Fatalf("effective policy label exposed raw args: %q", policy.Reviewer.Candidates[0].Label)
 	}
 }
 
@@ -204,5 +219,72 @@ func TestAgentArgsForCandidate_AppendsCandidateArgsWithoutMutatingConfig(t *test
 	got[0] = "changed"
 	if cfg.AgentArgsOverride["pi"][0] != "--thinking" || candidate.Args[0] != "--provider" {
 		t.Fatal("AgentArgsForCandidate aliased its config inputs")
+	}
+}
+
+func TestEffectiveAgentRolePolicyFingerprintsCompleteLaunchArguments(t *testing.T) {
+	candidate := AgentCandidate{Harness: types.AgentCodex, Args: []string{"--sandbox", "workspace-write"}}
+	first := &Config{AgentRoles: AgentRoles{Reviewer: RoleSelection{candidate}}, AgentArgsOverride: map[string][]string{"codex": {"--model", "first"}}}
+	second := &Config{AgentRoles: AgentRoles{Reviewer: RoleSelection{candidate}}, AgentArgsOverride: map[string][]string{"codex": {"--model", "second"}}}
+	firstHash := first.EffectiveAgentRolePolicy().Reviewer.Candidates[0].ArgsSHA256
+	secondHash := second.EffectiveAgentRolePolicy().Reviewer.Candidates[0].ArgsSHA256
+	if firstHash == "" || secondHash == "" || firstHash == secondHash {
+		t.Fatalf("effective launch hashes = %q/%q", firstHash, secondHash)
+	}
+}
+
+func TestResolveAgentWithReportRetainsUnavailableAndDuplicateCandidates(t *testing.T) {
+	secret := "candidate-secret-must-not-leak"
+	cfg := &Config{
+		Agent:  types.AgentClaude,
+		Agents: []types.AgentName{types.AgentClaude},
+		AgentRoles: AgentRoles{
+			Reviewer: RoleSelection{
+				{Harness: types.AgentPi, Provider: "openai", Model: "gpt-5.4", Args: []string{"--token", secret}},
+				{Harness: types.AgentCodex, Provider: "openai", Model: "gpt-5.4"},
+				{Harness: types.AgentCodex, Provider: "openai", Model: "gpt-5.4"},
+			},
+			Implementer: RoleSelection{{Harness: types.AgentClaude, Provider: "anthropic", Model: "claude-opus-5"}},
+		},
+	}
+	lookPath := func(path string) (string, error) {
+		if path == "pi" {
+			return "", exec.ErrNotFound
+		}
+		return "/bin/" + path, nil
+	}
+
+	report, err := cfg.ResolveAgentWithReport(context.Background(), lookPath)
+	if err != nil {
+		t.Fatalf("ResolveAgentWithReport: %v", err)
+	}
+	if got := cfg.AgentRoles.Reviewer; len(got) != 1 || got[0].Harness != types.AgentCodex {
+		t.Fatalf("runnable reviewer selection = %+v, want one codex candidate", got)
+	}
+	got := report.Reviewer.Candidates
+	if len(got) != 3 {
+		t.Fatalf("reviewer report = %+v, want all 3 configured candidates", got)
+	}
+	if got[0].Index != 0 || got[0].Status != AgentCandidateUnavailable || got[0].Reason != AgentCandidateReasonExecutableNotFound {
+		t.Fatalf("unavailable candidate = %+v", got[0])
+	}
+	if got[1].Index != 1 || got[1].Status != AgentCandidateAvailable {
+		t.Fatalf("available candidate = %+v", got[1])
+	}
+	if got[2].Index != 2 || got[2].Status != AgentCandidateSkipped || got[2].Reason != AgentCandidateReasonDuplicate {
+		t.Fatalf("duplicate candidate = %+v", got[2])
+	}
+	if strings.Contains(report.Reviewer.Candidates[0].Label, secret) {
+		t.Fatalf("public resolution label exposes arguments: %q", report.Reviewer.Candidates[0].Label)
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), "--token") {
+		t.Fatalf("resolution snapshot exposes raw arguments: %s", encoded)
+	}
+	if report.Reviewer.Candidates[0].ArgsSHA256 == "" {
+		t.Fatal("resolution snapshot lost redacted argument identity")
 	}
 }

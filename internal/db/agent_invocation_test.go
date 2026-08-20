@@ -53,6 +53,39 @@ func intPtr(v int) *int { return &v }
 // TestAgentInvocations_NullableFidelityFieldsRoundTrip proves the session-
 // fidelity columns survive an insert/read cycle both when populated and when
 // left unknown (NULL), so missing data reads back as nil rather than zero.
+func TestAgentInvocations_RoleCandidateEvidenceRoundTrip(t *testing.T) {
+	d, _, run := openSessionTestDB(t)
+	declaredProvider := "openai"
+	declaredModel := "gpt-5.6-sol"
+	observedProvider := "openai"
+	observedModel := "gpt-5.6-sol-20260819"
+	role := "reviewer"
+	harness := "codex"
+	candidateIndex := 1
+	inv := AgentInvocation{
+		RunID: run.ID, StepName: "review", Round: 2, Purpose: "review",
+		Agent: "candidate[harness=\"codex\";provider=\"openai\";model=\"gpt-5.6-sol\"]",
+		Role:  &role, CandidateIndex: &candidateIndex, DeclaredHarness: &harness,
+		DeclaredProvider: &declaredProvider, DeclaredModel: &declaredModel,
+		ObservedProvider: &observedProvider, ObservedModel: &observedModel,
+		SessionMode: InvocationModeCold, StartedAt: 1, CompletedAt: 2, DurationMS: 1, ExitStatus: "ok",
+	}
+	if _, err := d.InsertAgentInvocation(inv); err != nil {
+		t.Fatalf("insert invocation: %v", err)
+	}
+	got, err := d.GetAgentInvocationsByRun(run.ID)
+	if err != nil {
+		t.Fatalf("get invocations: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d invocation rows, want 1", len(got))
+	}
+	back := got[0]
+	if back.Role == nil || *back.Role != role || back.CandidateIndex == nil || *back.CandidateIndex != 1 || back.DeclaredHarness == nil || *back.DeclaredHarness != harness || back.DeclaredProvider == nil || *back.DeclaredProvider != declaredProvider || back.DeclaredModel == nil || *back.DeclaredModel != declaredModel || back.ObservedProvider == nil || *back.ObservedProvider != observedProvider || back.ObservedModel == nil || *back.ObservedModel != observedModel {
+		t.Fatalf("role candidate evidence = %+v", back)
+	}
+}
+
 func TestAgentInvocations_NullableFidelityFieldsRoundTrip(t *testing.T) {
 	d, _, run := openSessionTestDB(t)
 
@@ -332,6 +365,66 @@ func TestRecoverStaleRunsAccumulatesParkedTime(t *testing.T) {
 	}
 	if got.ParkedMS < 59_000 || got.ParkedMS > 62_000 {
 		t.Fatalf("ParkedMS = %d, want ~60000 accumulated from the crashed park", got.ParkedMS)
+	}
+}
+
+func TestAgentEvidenceReadOnlyCompatibilityBeforeSliceMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.sqlite")
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := d.InsertRepo("/tmp/repo", "https://github.com/test/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := d.InsertRun(repo.ID, "feature", "head", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.InsertAgentInvocation(AgentInvocation{RunID: run.ID, StepName: "review", Round: 1, Purpose: "review", Agent: "codex", SessionMode: InvocationModeCold, StartedAt: 1, CompletedAt: 2, DurationMS: 1, ExitStatus: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, column := range []string{"agent_role_snapshot", "agent_role_snapshot_hash"} {
+		if _, err := d.sql.Exec(`ALTER TABLE runs DROP COLUMN ` + column); err != nil {
+			t.Fatalf("drop runs.%s: %v", column, err)
+		}
+	}
+	for _, column := range []string{"role", "candidate_index", "declared_harness", "declared_provider", "declared_model", "observed_provider", "observed_model"} {
+		if _, err := d.sql.Exec(`ALTER TABLE agent_invocations DROP COLUMN ` + column); err != nil {
+			t.Fatalf("drop agent_invocations.%s: %v", column, err)
+		}
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	readOnly, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRun, err := readOnly.GetRunForAgentEvidence(run.ID)
+	if err != nil || legacyRun == nil || legacyRun.AgentRoleSnapshot != nil || legacyRun.AgentRoleSnapshotHash != nil {
+		t.Fatalf("legacy run evidence = %+v, err %v", legacyRun, err)
+	}
+	attempts, err := readOnly.GetAgentInvocationsByRunForEvidence(run.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].Role != nil || attempts[0].CandidateIndex != nil {
+		t.Fatalf("legacy attempts = %+v, err %v", attempts, err)
+	}
+	if err := readOnly.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrate legacy evidence schema: %v", err)
+	}
+	defer migrated.Close()
+	if err := migrated.SetRunAgentRoleSnapshot(run.ID, `{"schema":"v1"}`, "hash"); err != nil {
+		t.Fatalf("snapshot columns missing after migration: %v", err)
+	}
+	role := "reviewer"
+	if _, err := migrated.InsertAgentInvocation(AgentInvocation{RunID: run.ID, StepName: "review", Round: 2, Purpose: "review", Agent: "codex", Role: &role, SessionMode: InvocationModeCold, StartedAt: 3, CompletedAt: 4, DurationMS: 1, ExitStatus: "ok"}); err != nil {
+		t.Fatalf("candidate identity columns missing after migration: %v", err)
 	}
 }
 

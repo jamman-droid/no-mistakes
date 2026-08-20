@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -115,6 +116,32 @@ func TestRunSessions_RoleReusesOneSession(t *testing.T) {
 		if call.session == nil || call.session.ID != "sess-1" {
 			t.Fatalf("turn %d must resume sess-1, got %+v", i+2, call.session)
 		}
+	}
+}
+
+func TestRunSessions_AttemptEvidenceFailureDoesNotRepeatSuccessfulResume(t *testing.T) {
+	d, run := sessionTestDB(t)
+	fake := newFakeSessionAgent()
+	wrapped := &perfRecordingAgent{
+		inner: fake, db: d, runID: run.ID, stepName: "review", role: "reviewer",
+		round: func() int { return 1 },
+	}
+	rs := NewRunSessions(d, run.ID, wrapped, true)
+	if _, err := rs.Run(context.Background(), wrapped, SessionRoleFixer, agent.RunOpts{Prompt: "first"}, nil); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := rs.Run(context.Background(), wrapped, SessionRoleFixer, agent.RunOpts{Prompt: "resume"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "attempt evidence") {
+		t.Fatalf("persistence error = %v", err)
+	}
+	if result == nil || !result.Resumed {
+		t.Fatalf("successful resumed result was lost: %+v", result)
+	}
+	if len(fake.calls) != 2 {
+		t.Fatalf("successful resume was repeated: calls = %d, want 2 total", len(fake.calls))
 	}
 }
 

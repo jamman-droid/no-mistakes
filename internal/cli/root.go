@@ -83,6 +83,8 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().BoolVarP(&autoYes, "yes", "y", false, "run setup wizard and accept defaults automatically")
 	cmd.Flags().StringVar(&skipValue, "skip", "", "comma-separated pipeline steps to skip for a new run")
 
+	cmd.AddCommand(newCapabilitiesCmd())
+	cmd.AddCommand(newRolesCmd())
 	cmd.AddCommand(newInitCmd())
 	cmd.AddCommand(newEjectCmd())
 	cmd.AddCommand(newUpdateCmd())
