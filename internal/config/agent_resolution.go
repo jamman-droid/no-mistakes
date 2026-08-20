@@ -207,12 +207,12 @@ func safeEvidenceHarness(harness types.AgentName) types.AgentName {
 	return types.AgentName("redacted-" + evidenceIdentityHash(value))
 }
 
-// safeEvidenceIdentity is the emission boundary, not the parse boundary: it is
+// safeEvidenceIdentity is the evidence boundary, not the parse boundary: it is
 // deliberately narrower than safeAgentIdentityToken so a configured identity can
-// never carry ':' or '@' into evidence. A value it refuses collapses to a stable
-// per-value fingerprint rather than an empty string, because the result also
-// identifies a candidate (AgentCandidate.Label backs session ownership and
-// attempt attribution) and two distinct candidates must never share one label.
+// never carry ':' or '@' into recorded evidence. A refused value collapses to a
+// stable per-value fingerprint rather than an empty string, so evidence still
+// reports that an identity was configured and keeps distinct candidates
+// distinguishable.
 func safeEvidenceIdentity(value string) string {
 	if value == "" {
 		return ""

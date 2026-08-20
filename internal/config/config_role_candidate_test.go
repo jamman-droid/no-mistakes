@@ -122,18 +122,16 @@ func TestLoadAgentRoles_AcceptsLegacyVersionSeparatorIdentities(t *testing.T) {
 	}
 }
 
-func TestAgentCandidateLabelRedactsUnsafeIdentityWithoutCollapsingCandidates(t *testing.T) {
-	first := AgentCandidate{Harness: types.AgentPi, Provider: "ollama", Model: "llama3:8b"}
-	second := AgentCandidate{Harness: types.AgentPi, Provider: "ollama", Model: "llama3:70b"}
-	firstLabel, secondLabel := first.Label(), second.Label()
-	if strings.Contains(firstLabel, "llama3:8b") || strings.Contains(secondLabel, "llama3:70b") {
-		t.Fatalf("labels leaked raw model identity: %q/%q", firstLabel, secondLabel)
+func TestAgentCandidateLabelIsAStableDurableSessionOwnershipKey(t *testing.T) {
+	got := AgentCandidate{Harness: types.AgentPi, Provider: "ollama", Model: "llama3:8b"}.Label()
+	if want := `candidate[harness="pi";provider="ollama";model="llama3:8b"]`; got != want {
+		t.Fatalf("session ownership key = %q, want %q", got, want)
 	}
-	if firstLabel == secondLabel {
-		t.Fatalf("distinct candidates collapsed to one label: %q", firstLabel)
+	if other := (AgentCandidate{Harness: types.AgentPi, Provider: "ollama", Model: "llama3:70b"}).Label(); other == got {
+		t.Fatalf("distinct candidates collapsed to one key: %q", got)
 	}
 	if bare := (AgentCandidate{Harness: types.AgentPi}).Label(); bare != "pi" {
-		t.Fatalf("legacy bare candidate label = %q", bare)
+		t.Fatalf("legacy bare candidate key = %q", bare)
 	}
 }
 

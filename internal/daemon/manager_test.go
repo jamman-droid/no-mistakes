@@ -46,6 +46,29 @@ func TestNewPipelineAgentsUsesDistinctRoleSelections(t *testing.T) {
 	}
 }
 
+func TestNewPipelineAgentsResumeSessionsPersistedByEarlierBuilds(t *testing.T) {
+	persisted := `candidate[harness="claude";provider="ollama";model="llama3:8b"]`
+	candidate := config.AgentCandidate{Harness: types.AgentClaude, Provider: "ollama", Model: "llama3:8b"}
+	cfg := &config.Config{
+		Agent:  types.AgentClaude,
+		Agents: []types.AgentName{types.AgentClaude},
+		AgentRoles: config.AgentRoles{
+			Reviewer:    config.RoleSelection{candidate},
+			Implementer: config.RoleSelection{candidate},
+		},
+	}
+	set, err := newPipelineAgents(context.Background(), cfg, func(bin string) (string, error) {
+		return "/usr/bin/" + bin, nil
+	})
+	if err != nil {
+		t.Fatalf("newPipelineAgents: %v", err)
+	}
+	defer set.Close()
+	if !agent.SupportsSessionProvider(set.Roles.Implementer, persisted) {
+		t.Fatalf("persisted fixer session provider %q is no longer configured; implementer = %q", persisted, set.Roles.Implementer.Name())
+	}
+}
+
 func TestNewPipelineAgentsRunsSameHarnessCandidatesInDeclaredOrder(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "attempts.log")
 	secretArg := "--api-key=top-secret-value"

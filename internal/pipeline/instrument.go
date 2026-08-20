@@ -17,17 +17,17 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
+type attemptEvidencePersistenceError struct{ err error }
+
+func (e *attemptEvidencePersistenceError) Error() string { return e.err.Error() }
+func (e *attemptEvidencePersistenceError) Unwrap() error { return e.err }
+
 // perfRecordingAgent decorates the step agent to persist one local
 // agent_invocations row per invocation: identity, purpose, session mode,
 // timing, exit status, and token usage. Recording is local-only. For pipeline
 // roles it is also an attestation boundary: a failed insert fails the wrapper
 // after the concrete attempt returns rather than silently claiming complete
 // evidence. No per-invocation record leaves the machine.
-type attemptEvidencePersistenceError struct{ err error }
-
-func (e *attemptEvidencePersistenceError) Error() string { return e.err.Error() }
-func (e *attemptEvidencePersistenceError) Unwrap() error { return e.err }
-
 type perfRecordingAgent struct {
 	inner      agent.Agent
 	db         *db.DB
@@ -135,10 +135,9 @@ func (a *perfRecordingAgent) record(ctx context.Context, opts agent.RunOpts, age
 	return nil
 }
 
-// recordResult folds a successful (or partially successful) result's identity,
-// usage, per-round token deltas, and bounded activity metrics into inv. Every
-// field the adapter did not report is left nil so it is stored as unknown
-// rather than a fabricated zero.
+// applyCandidateIdentity binds inv to the configured role candidate whose
+// runtime label served this attempt, recording its declared index, harness,
+// provider, and model.
 func (a *perfRecordingAgent) applyCandidateIdentity(inv *db.AgentInvocation, agentName string) {
 	for _, candidate := range a.candidates {
 		if candidate.RuntimeLabel != agentName {
@@ -160,6 +159,10 @@ func (a *perfRecordingAgent) applyCandidateIdentity(inv *db.AgentInvocation, age
 	}
 }
 
+// recordResult folds a successful (or partially successful) result's identity,
+// usage, per-round token deltas, and bounded activity metrics into inv. Every
+// field the adapter did not report is left nil so it is stored as unknown
+// rather than a fabricated zero.
 func (a *perfRecordingAgent) recordResult(inv *db.AgentInvocation, sessionKey string, result *agent.Result) {
 	if result == nil {
 		return

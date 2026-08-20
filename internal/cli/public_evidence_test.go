@@ -189,6 +189,61 @@ func TestRunEvidenceSeparatesDeclaredFromObservedAndRedactsUnavailableCandidates
 	}
 }
 
+func TestRunEvidenceKeepsACPDeclaredHarnessConsistentAcrossBothHalves(t *testing.T) {
+	acp := types.AgentName("acp:gemini")
+	resolution := config.AgentRoleResolution{
+		Schema: config.AgentRoleResolutionSchema,
+		Reviewer: config.RoleResolution{Source: config.AgentRoleSourceGlobalRole, Candidates: []config.AgentCandidateResolution{
+			{Index: 0, Harness: acp, Label: "candidate-0", Status: config.AgentCandidateAvailable},
+		}},
+	}
+	snapshot, err := json.Marshal(resolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(snapshot)
+	hash := fmt.Sprintf("%x", sum[:])
+	role, harness, index := "reviewer", string(acp), 0
+	run := &db.Run{ID: "run-acp", AgentRoleSnapshot: strPtrPublic(string(snapshot)), AgentRoleSnapshotHash: &hash}
+	invocations := []db.AgentInvocation{{
+		ID: "inv-1", RunID: run.ID, StepName: "review", Round: 1, Purpose: "review",
+		Agent: harness, Role: &role, CandidateIndex: &index, DeclaredHarness: &harness,
+		SessionMode: db.InvocationModeCold, ExitStatus: "ok",
+	}}
+	evidence, err := makeRunEvidence(run, invocations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		RoleConfig struct {
+			Roles struct {
+				Reviewer struct {
+					Candidates []struct {
+						Harness string `json:"harness"`
+					} `json:"candidates"`
+				} `json:"reviewer"`
+			} `json:"roles"`
+		} `json:"role_config"`
+		Attempts []struct {
+			Harness *string `json:"declared_harness"`
+		} `json:"attempts"`
+	}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	candidates := decoded.RoleConfig.Roles.Reviewer.Candidates
+	if len(candidates) != 1 || candidates[0].Harness != string(acp) {
+		t.Fatalf("role_config candidate harness = %+v", candidates)
+	}
+	if len(decoded.Attempts) != 1 || decoded.Attempts[0].Harness == nil || *decoded.Attempts[0].Harness != string(acp) {
+		t.Fatalf("attempt declared_harness disagrees with role_config: %s", encoded)
+	}
+}
+
 func TestRunEvidenceMarksLegacySnapshotUnavailableAndUnknownOutcomesHonestly(t *testing.T) {
 	evidence, err := makeRunEvidence(&db.Run{ID: "legacy"}, []db.AgentInvocation{{ID: "old", ExitStatus: "future-status"}})
 	if err != nil {

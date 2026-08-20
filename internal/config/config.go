@@ -708,15 +708,15 @@ func safeAgentIdentityToken(value string) bool {
 }
 
 // Label is the bounded, argument-redacted candidate identity used in logs,
-// session ownership, fallback attempts, and durable invocation records.
+// session ownership, fallback attempts, and durable invocation records. It is a
+// private key, not an evidence value: agent_sessions.agent rows written by
+// earlier builds are matched against it verbatim, so it must stay byte-stable
+// across versions. Public surfaces sanitize independently before emitting.
 func (c AgentCandidate) Label() string {
-	harness := string(safeEvidenceHarness(c.Harness))
-	provider := safeEvidenceIdentity(c.Provider)
-	model := safeEvidenceIdentity(c.Model)
-	if provider == "" && model == "" && len(c.Args) == 0 {
-		return harness
+	if c.Provider == "" && c.Model == "" && len(c.Args) == 0 {
+		return string(c.Harness)
 	}
-	label := fmt.Sprintf("candidate[harness=%q;provider=%q;model=%q", harness, provider, model)
+	label := fmt.Sprintf("candidate[harness=%q;provider=%q;model=%q", string(c.Harness), c.Provider, c.Model)
 	if len(c.Args) > 0 {
 		label += ";args=" + candidateArgsFingerprint(c.Args)[:24]
 	}

@@ -307,7 +307,7 @@ func makeRunEvidence(run *db.Run, invocations []db.AgentInvocation) (any, error)
 		attempts = append(attempts, publicAttemptEvidence{
 			ID: invocation.ID, Step: invocation.StepName, Round: invocation.Round, Purpose: invocation.Purpose,
 			Role: role, CandidateIndex: invocation.CandidateIndex, Candidate: candidateID,
-			Harness: safeObservedPointer(invocation.DeclaredHarness), DeclaredProvider: safeObservedPointer(invocation.DeclaredProvider), DeclaredModel: safeObservedPointer(invocation.DeclaredModel),
+			Harness: safeHarnessPointer(invocation.DeclaredHarness), DeclaredProvider: safeObservedPointer(invocation.DeclaredProvider), DeclaredModel: safeObservedPointer(invocation.DeclaredModel),
 			ObservedProvider: safeObservedPointer(invocation.ObservedProvider), ObservedModel: safeObservedPointer(invocation.ObservedModel),
 			Outcome: outcome, Reason: reason, FallbackReason: safePublicReasonPointer(invocation.FallbackReason),
 			SessionMode: invocation.SessionMode, SessionOwner: owner,
@@ -403,6 +403,17 @@ func safePublicValue(value string) string {
 		return ""
 	}
 	return safe
+}
+
+func safeHarnessPointer(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	safe := safePublicHarness(*value)
+	if safe == "" {
+		return nil
+	}
+	return &safe
 }
 
 func safeObservedPointer(value *string) *string {
